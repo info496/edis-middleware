@@ -192,3 +192,32 @@ def get_data(
         return rows
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"errore lettura cache: {e}")
+# --- DIAGNOSTICA SEMPLICE (aggiunta) ---
+import os, os.path, json, logging
+logger = logging.getLogger("uvicorn.error")
+
+@app.get("/diag")
+def diag():
+    p = os.getenv("STORAGE_STATE")
+    exists = bool(p and os.path.exists(p))
+    size = os.path.getsize(p) if exists else 0
+    # Proviamo anche a contare quanti cookie ci sono nel file
+    head = {"cookies_count": None, "origins_count": None}
+    try:
+        if exists:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                head["cookies_count"] = len(data.get("cookies", []) or [])
+                head["origins_count"] = len(data.get("origins", []) or [])
+    except Exception as e:
+        head["error"] = str(e)
+
+    return {
+        "version": "diag-1",
+        "storage_state_path": p,
+        "exists": exists,
+        "size_bytes": size,
+        "head": head,
+        "allow_origins": ALLOW,
+    }
