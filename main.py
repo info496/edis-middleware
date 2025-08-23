@@ -18,13 +18,18 @@ log = logging.getLogger("edis")
 app = FastAPI(title="e-Distribuzione CSV Middleware", version="1.0")
 
 # --- CORS ---
+from fastapi.middleware.cors import CORSMiddleware
+
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
+    allow_origins=[o.strip() for o in ALLOW_ORIGINS if o.strip()],
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*", "Content-Type", "X-API-Key"],
+    expose_headers=["*"],
+    max_age=86400,
 )
 
 # --- API Key guard (opzionale) ---
