@@ -1,408 +1,230 @@
-from __future__ import annotations
-
-import asyncio
-import csv
-import io
+# edis_pw.py
 import os
 import re
-import tempfile
-import time
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Optional
+from playwright.async_api import async_playwright, Page, BrowserContext, Download
 
-from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PWTimeout
+# Percorsi/variabili
+STORAGE_STATE = os.getenv("STORAGE_STATE", "/app/storage_state.json")
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/app/tmpdl")
+CACHE_DIR = os.getenv("CACHE_DIR", "/app/cache")
+HOME_URL = "https://private.e-distribuzione.it/PortaleClienti/s/"
 
-
-# =====================================================================
-# CONFIG DI BASE
-# =====================================================================
-BASE_URL = "https://private.e-distribuzione.it/PortaleClienti/s"
-CURVE_URL = f"{BASE_URL}/curvedicarico"        # nel portale risulta "curvedicarico"
-NAV_TIMEOUT = 45000                             # ms (navigazione)
-STEP_TIMEOUT = 20000                            # ms (operazioni singole)
-DOWNLOAD_TIMEOUT = 60000                        # ms
-
-
-# =====================================================================
-# FUNZIONI DI SUPPORTO
-# =====================================================================
-
-async def _goto_curve_page(page: Page) -> None:
-    """Apre la pagina 'Curve di carico' e attende che sia pronta."""
-    # prova direttamente l'url "curvedicarico"
-    await page.goto(CURVE_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-
-    # fallback: se non carica la sezione, prova l'homepage e poi "LE MIE MISURE"
-    if not await _is_curve_page(page):
-        await page.goto(BASE_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-        # Apri la tile "LE MIE MISURE" (testo presente nello screenshot)
-        try:
-            tile = page.get_by_text("LE MIE MISURE", exact=False)
-            await tile.first.click(timeout=STEP_TIMEOUT)
-        except Exception:
-            pass
-
-        # riprova a raggiungere "curvedicarico"
-        if not await _is_curve_page(page):
-            await page.goto(CURVE_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-
-    # attende presenza di qualcosa che identifichi la pagina
-    await _wait_curve_ready(page)
+# Alcuni possibili endpoint della pagina curve di carico
+CURVES_URL_CANDIDATES = [
+    "https://private.e-distribuzione.it/PortaleClienti/s/curvedicarico",
+    "https://private.e-distribuzione.it/PortaleClienti/s/curve-di-carico",
+    "https://private.e-distribuzione.it/PortaleClienti/s/curva-di-carico",
+]
 
 
-async def _is_curve_page(page: Page) -> bool:
-    txts = ["Curve di carico", "Curva di carico", "curvedicarico"]
-    page_text = (await page.content()).lower()
-    return any(t.lower() in page_text for t in txts)
+# ------------------------- utility -------------------------
 
-
-async def _wait_curve_ready(page: Page) -> None:
-    # Qualche etichetta tipica visibile in pagina
-    candidates = [
-        "Curve di carico",
-        "Curva di carico",
-        "Periodo di riferimento",
-        "Modifica periodo",
-        "Scarica il dettaglio quartorario",
-    ]
-    for _ in range(3):
-        html = (await page.content()).lower()
-        if any(c.lower() in html for c in candidates):
-            return
-        await asyncio.sleep(0.8)
-    # Se non ha trovato nulla, lascia comunque proseguire (magari i componenti sono shadow)
-    return
-
-
-async def _select_period(page: Page, date_from: date, date_to: date) -> None:
+def _it_date(d: str) -> str:
     """
-    Imposta il periodo Inizio/Fine. Il portale usa Salesforce Lightning/LWC,
-    quindi possono esserci <select> o componenti custom. Tenta varie strategie.
+    Converte 'YYYY-MM-DD' in 'DD/MM/YYYY'.
+    Se è già in formato italiano, lo restituisce com'è.
     """
-
-    # 1) Se c'è il bottone "Modifica periodo", cliccalo
     try:
-        await page.get_by_role("button", name=re.compile("Modifica periodo", re.I)).click(timeout=STEP_TIMEOUT)
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        return d
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+# ------------------------- browser/context -------------------------
+
+async def _open_context(pw, use_storage: bool, log=print):
+    _ensure_dir(DOWNLOAD_DIR)
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage"],
+    )
+    if use_storage and os.path.exists(STORAGE_STATE):
+        context = await browser.new_context(storage_state=STORAGE_STATE)
+        log(f"[ctx] storage_state in uso: {STORAGE_STATE}")
+    else:
+        context = await browser.new_context()
+        if use_storage:
+            log(f"[ctx] storage_state NON trovato: {STORAGE_STATE}")
+
+    context.set_default_timeout(45_000)
+    page = await context.new_page()
+    return browser, context, page
+
+
+# ------------------------- navigazione -------------------------
+
+async def _goto_curves(page: Page, log=print):
+    # Prova direttamente gli URL candidati
+    for url in CURVES_URL_CANDIDATES:
+        try:
+            await page.goto(url, wait_until="load")
+            await page.wait_for_load_state("networkidle")
+            if await page.get_by_text(re.compile(r"curve\s+di\s+carico", re.I)).count() > 0:
+                log(f"[nav] pagina curve OK: {url}")
+                return
+        except Exception as e:
+            log(f"[nav] {url}: {e}")
+
+    # Fallback: vai in home e poi clicca i riquadri
+    await page.goto(HOME_URL, wait_until="load")
+    await page.wait_for_load_state("networkidle")
+
+    # 'LE MIE MISURE'
+    try:
+        btn = page.get_by_text(re.compile(r"le\s+mie\s+misure", re.I))
+        if await btn.count():
+            await btn.first.click()
+            await page.wait_for_load_state("networkidle")
     except Exception:
         pass
 
-    # Prova una strategia con select "Inizio" (Mese/Anno) e "Fine"
-    # La pagina nello screenshot mostra due gruppi con label "Inizio" e "Fine".
-    strategies = [_try_set_period_by_selects, _try_set_period_by_inputs]
+    # 'Curve di carico'
+    link = page.get_by_text(re.compile(r"curve\s+di\s+carico", re.I))
+    if await link.count() == 0:
+        raise RuntimeError("Link 'Curve di carico' non trovato")
+    await link.first.click()
+    await page.wait_for_load_state("networkidle")
 
-    for strat in strategies:
+
+# ------------------------- periodo -------------------------
+
+async def _fill_dates(page: Page, date_from: str, date_to: str, log=print):
+    df = _it_date(date_from)
+    dt = _it_date(date_to)
+
+    candidates_from = [
+        page.get_by_label(re.compile(r"inizio", re.I)),
+        page.locator("input[placeholder*='Inizio' i]"),
+    ]
+    candidates_to = [
+        page.get_by_label(re.compile(r"fine", re.I)),
+        page.locator("input[placeholder*='Fine' i]"),
+    ]
+
+    async def set_input(loc_list, value, name):
+        for loc in loc_list:
+            try:
+                if await loc.count():
+                    inp = loc.first
+                    await inp.click()
+                    await inp.fill("")
+                    await inp.type(value, delay=20)
+                    return True
+            except Exception as e:
+                log(f"[date] {name} fallback err: {e}")
+        return False
+
+    ok_from = await set_input(candidates_from, df, "Inizio")
+    ok_to = await set_input(candidates_to, dt, "Fine")
+
+    if not (ok_from and ok_to):
+        # Estremo fallback: prendi i primi due input che sembrano date
+        inputs = page.locator("input[type='text'], input[type='date']")
         try:
-            ok = await strat(page, date_from, date_to)
-            if ok:
-                return
+            if await inputs.count() >= 2:
+                await inputs.nth(0).fill(df)
+                await inputs.nth(1).fill(dt)
+                ok_from = ok_to = True
         except Exception:
             pass
 
-    # Non è critico se non riesce ad impostare: molti portali mantengono il default; in caso,
-    # il click al pulsante di download spesso usa l’intervallo già impostato (o ultimo usato).
-    return
-
-
-async def _try_set_period_by_selects(page: Page, dfrom: date, dto: date) -> bool:
-    """
-    Cerca gruppi 'Inizio'/'Fine' con due <select> per Mese e Anno.
-    """
-    # helper
-    def month_it(m: int) -> str:
-        # nomi mesi possibili (alcuni portali usano testo)
-        mesi = ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
-                "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"]
-        return mesi[m - 1]
-
-    async def _set(label_text: str, dt: date) -> None:
-        # Cerca contenitore vicino alla label
-        root = page.get_by_text(re.compile(rf"^{label_text}\s*$", re.I)).locator("xpath=..")
-        # due select: Mese e Anno
-        selects = root.locator("select")
-        count = await selects.count()
-        if count >= 2:
-            # prova prima con testo (mese) poi anno
-            try:
-                await selects.nth(0).select_option(label=month_it(dt.month))
-            except Exception:
-                # fallback: value numerico mese
-                await selects.nth(0).select_option(value=str(dt.month))
-            await selects.nth(1).select_option(value=str(dt.year))
-        else:
-            # prova a trovare select discendenti
-            selects = root.locator("select")
-            c2 = await selects.count()
-            if c2 >= 2:
-                try:
-                    await selects.nth(0).select_option(label=month_it(dt.month))
-                except Exception:
-                    await selects.nth(0).select_option(value=str(dt.month))
-                await selects.nth(1).select_option(value=str(dt.year))
-            else:
-                raise RuntimeError("selects not found")
-
+    # Se esiste il pulsante "Modifica periodo" cliccalo
     try:
-        await _set("Inizio", dfrom)
-        await _set("Fine", dto)
-        return True
+        btn = page.get_by_role("button", name=re.compile(r"modifica\s+periodo", re.I))
+        if await btn.count():
+            await btn.first.click()
     except Exception:
-        return False
+        pass
+
+    log(f"[date] periodo impostato {df} → {dt}")
 
 
-async def _try_set_period_by_inputs(page: Page, dfrom: date, dto: date) -> bool:
-    """
-    Alcuni portali usano input 'YYYY-MM-DD' con icona calendario.
-    """
-    # prova a trovare 2 input con tipo date
-    inputs = page.locator("input[type=date]")
-    count = await inputs.count()
-    if count >= 2:
-        await inputs.nth(0).fill(dfrom.isoformat())
-        await inputs.nth(1).fill(dto.isoformat())
-        return True
+# ------------------------- CSV -------------------------
 
-    # fallback: 2 input testuali vicino a label "Inizio"/"Fine"
-    async def _fill_near(label_text: str, val: str) -> bool:
-        try:
-            lab = page.get_by_text(re.compile(rf"^{label_text}\s*$", re.I))
-            root = lab.locator("xpath=..")
-            inp = root.locator("input")
-            if await inp.count() == 0:
-                inp = root.locator("xpath=.//input")
-            await inp.first.fill(val, timeout=STEP_TIMEOUT)
-            return True
-        except Exception:
-            return False
+async def _click_download_csv(page: Page, log=print) -> Download:
+    # il link è in fondo, assicuriamoci di vedere il footer
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(700)
 
-    ok1 = await _fill_near("Inizio", dfrom.isoformat())
-    ok2 = await _fill_near("Fine", dto.isoformat())
-    return ok1 and ok2
-
-
-async def _click_download_csv(page: Page) -> str:
-    """
-    Clicca il pulsante 'Scarica il dettaglio quartorario .csv' e restituisce
-    il percorso del file scaricato.
-    """
-    # Possibili label del bottone (in minuscolo per match case-insensitive)
-    labels = [
-        "Scarica il dettaglio quartorario .csv",
-        "Scarica il dettaglio quartorario",
-        "Download CSV",
-        "Scarica csv",
+    candidates = [
+        page.get_by_text(re.compile(r"scarica.*quart.?orario.*csv", re.I)),
+        page.get_by_role("link", name=re.compile(r"csv", re.I)),
+        page.get_by_role("button", name=re.compile(r"csv", re.I)),
+        page.locator("a[href$='.csv']"),
+        page.locator("a:has-text('CSV'), button:has-text('CSV')"),
     ]
 
-    # Trova e clicca
-    for name in labels:
-        locs = [
-            page.get_by_role("button", name=re.compile(name, re.I)),
-            page.get_by_text(re.compile(name, re.I)),
-        ]
-        for loc in locs:
-            try:
-                async with page.expect_download(timeout=DOWNLOAD_TIMEOUT) as dl:
-                    await loc.first.click(timeout=STEP_TIMEOUT)
-                download = await dl.value
-                tmp = os.path.join(tempfile.gettempdir(), f"edis_{int(time.time())}.csv")
-                await download.save_as(tmp)
-                return tmp
-            except PWTimeout:
-                continue
-            except Exception:
-                continue
+    for loc in candidates:
+        try:
+            if await loc.count() > 0:
+                with page.expect_download() as dl_info:
+                    await loc.first.click()
+                return await dl_info.value
+        except Exception as e:
+            log(f"[csv] tentativo fallito: {e}")
 
+    # Debug utili se non trova nulla
+    await page.screenshot(path="/tmp/no_csv.png", full_page=True)
+    html = await page.content()
+    with open("/tmp/no_csv.html", "w", encoding="utf-8") as f:
+        f.write(html)
     raise RuntimeError("Pulsante download CSV non trovato")
 
 
-def _parse_number(s: str) -> Optional[float]:
-    s = s.strip()
-    if not s:
-        return None
-    # trasforma 1.234,56 -> 1234.56
-    s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
+# ------------------------- API principale -------------------------
 
-
-def _parse_csv_to_rows(csv_bytes: bytes) -> List[Dict[str, Any]]:
-    """
-    Parser CSV tollerante. Cerca colonne data/ora/kwh/quality.
-    Ritorna sempre una lista (anche vuota).
-    """
-    text = csv_bytes.decode("utf-8", errors="ignore")
-    # sniffer per delimitatore ; o ,
-    try:
-        dialect = csv.Sniffer().sniff(text[:1024], delimiters=";,")
-        delim = dialect.delimiter
-    except Exception:
-        # default: ;
-        delim = ";"
-
-    reader = csv.reader(io.StringIO(text), delimiter=delim)
-    rows = list(reader)
-    if not rows:
-        return []
-
-    # trova header (prima riga "vera")
-    header = None
-    data_rows = []
-    for r in rows:
-        if any(cell.strip() for cell in r):
-            header = [c.strip() for c in r]
-            break
-    if header is None:
-        return []
-
-    # indice colonne
-    lower = [h.lower() for h in header]
-    idx_date = next((i for i, h in enumerate(lower) if "data" in h or "date" in h), None)
-    idx_time = next((i for i, h in enumerate(lower) if "ora" in h or "time" in h), None)
-    idx_ts   = next((i for i, h in enumerate(lower) if "timestamp" in h or "data-ora" in h or "datetime" in h), None)
-    idx_val  = next((i for i, h in enumerate(lower) if "kwh" in h or "energia" in h or "valore" in h), None)
-    idx_q    = next((i for i, h in enumerate(lower) if "qualit" in h or "quality" in h), None)
-
-    # scorri righe dopo header
-    started = False
-    for r in rows:
-        if not started:
-            # salta finché non trovi l'header
-            if [c.strip() for c in r] == header:
-                started = True
-            continue
-        if not any(c.strip() for c in r):
-            continue
-
-        ts: Optional[str] = None
-        if idx_ts is not None and idx_ts < len(r) and r[idx_ts].strip():
-            ts_raw = r[idx_ts].strip()
-            # prova a normalizzare
-            ts = _normalize_ts(ts_raw)
-        elif idx_date is not None:
-            d_raw = r[idx_date].strip() if idx_date < len(r) else ""
-            t_raw = r[idx_time].strip() if (idx_time is not None and idx_time < len(r)) else "00:00"
-            ts = _normalize_ts(f"{d_raw} {t_raw}")
-
-        val: Optional[float] = None
-        if idx_val is not None and idx_val < len(r):
-            val = _parse_number(r[idx_val])
-
-        qual: Optional[str] = None
-        if idx_q is not None and idx_q < len(r):
-            qual = r[idx_q].strip()
-
-        if ts is not None and val is not None:
-            data_rows.append({"ts": ts, "kWh": val, "quality": qual})
-
-    return data_rows
-
-
-def _normalize_ts(s: str) -> Optional[str]:
-    s = s.strip()
-    if not s:
-        return None
-    # formati più comuni: "dd/mm/yyyy hh:mm", "yyyy-mm-dd hh:mm"
-    candidates = [
-        ("%d/%m/%Y %H:%M", "%Y-%m-%dT%H:%M:00"),
-        ("%d/%m/%Y %H.%M", "%Y-%m-%dT%H:%M:00"),
-        ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:00"),
-        ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:00"),
-        ("%d/%m/%Y", "%Y-%m-%dT00:00:00"),
-        ("%Y-%m-%d", "%Y-%m-%dT00:00:00"),
-    ]
-    for fmt_in, fmt_out in candidates:
-        try:
-            dt = datetime.strptime(s, fmt_in)
-            return dt.strftime(fmt_out)
-        except Exception:
-            continue
-    # prova a ripulire separatori strani
-    s2 = re.sub(r"[.]", ":", s)
-    for fmt_in, fmt_out in candidates:
-        try:
-            dt = datetime.strptime(s2, fmt_in)
-            return dt.strftime(fmt_out)
-        except Exception:
-            continue
-    return None
-
-
-# =====================================================================
-# API PRINCIPALI CHIAMATE DAL MIDDLEWARE
-# =====================================================================
-
-async def refresh_with_session(
-    storage_state_path: str,
+async def refresh_and_download_csv(
+    username: Optional[str],
+    password: Optional[str],
     pod: str,
-    date_from: date,
-    date_to: date,
-    timeout_ms: int = 90000,
-) -> List[Dict[str, Any]] | Dict[str, Any]:
+    date_from: str,
+    date_to: str,
+    use_storage: bool,
+    log=print,
+) -> str:
     """
-    Usa la sessione Playwright (storage_state.json) per evitare il login/CAPTCHA.
+    Ritorna il path del CSV salvato su disco.
+    Se use_storage=True usa i cookie/sessione di STORAGE_STATE,
+    altrimenti (login con credenziali) fallisce causa reCAPTCHA.
     """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx: BrowserContext = await browser.new_context(
-            storage_state=storage_state_path,
-            accept_downloads=True,
-        )
-        ctx.set_default_timeout(timeout_ms)
-        page = await ctx.new_page()
+    _ensure_dir(CACHE_DIR)
+    save_path = os.path.join(CACHE_DIR, "edis_quartorario.csv")
 
-        # 1) Pagina "Curve di carico"
-        await _goto_curve_page(page)
+    async with async_playwright() as pw:
+        browser, context, page = await _open_context(pw, use_storage, log)
 
-        # 2) Imposta periodo (best-effort; se fallisce usa valori già presenti)
-        await _select_period(page, date_from, date_to)
+        try:
+            if not use_storage:
+                # Qui si potrebbe provare un login "manuale", ma è bloccato da reCAPTCHA.
+                raise RuntimeError(
+                    "Login con credenziali bloccato dal reCAPTCHA. "
+                    "Usa la sessione salvata (use_storage=True)."
+                )
 
-        # 3) Download CSV
-        csv_path = await _click_download_csv(page)
+            await _goto_curves(page, log)
 
-        # 4) Parsing CSV -> righe
-        with open(csv_path, "rb") as f:
-            data = f.read()
-        rows = _parse_csv_to_rows(data)
+            # Se il campo POD è editabile, prova a impostarlo (sono casi rari)
+            try:
+                pod_inputs = page.locator("input[value^='IT']")
+                if await pod_inputs.count():
+                    await pod_inputs.first.fill(pod)
+            except Exception:
+                pass
 
-        await browser.close()
-        return rows
+            await _fill_dates(page, date_from, date_to, log)
 
+            dl = await _click_download_csv(page, log)
+            await dl.save_as(save_path)
+            log(f"[csv] salvato in {save_path}")
 
-async def refresh_with_login(
-    username: str,
-    password: str,
-    pod: str,
-    date_from: date,
-    date_to: date,
-    timeout_ms: int = 90000,
-) -> List[Dict[str, Any]] | Dict[str, Any]:
-    """
-    **Opzionale**: se vuoi mantenere anche il login classico (potrebbe scattare il CAPTCHA).
-    Completalo con i tuoi passi di autenticazione (in genere form Salesforce/Community).
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx: BrowserContext = await browser.new_context(accept_downloads=True)
-        ctx.set_default_timeout(timeout_ms)
-        page = await ctx.new_page()
+            return save_path
 
-        # TODO: completa i passi di login se vuoi usare questa via
-        # Esempio (pseudocodice):
-        # await page.goto(BASE_URL, timeout=NAV_TIMEOUT)
-        # await page.get_by_label("Username").fill(username)
-        # await page.get_by_label("Password").fill(password)
-        # await page.get_by_role("button", name=re.compile("Accedi", re.I)).click()
-        # ... eventuale 2FA ...
-        # Poi prosegui come con la sessione:
-
-        await _goto_curve_page(page)
-        await _select_period(page, date_from, date_to)
-        csv_path = await _click_download_csv(page)
-
-        with open(csv_path, "rb") as f:
-            data = f.read()
-        rows = _parse_csv_to_rows(data)
-
-        await browser.close()
-        return rows
+        finally:
+            await context.close()
+            await browser.close()
