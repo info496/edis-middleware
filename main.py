@@ -20,17 +20,18 @@ app = FastAPI(title="e-Distribuzione CSV Middleware", version="1.0")
 # --- CORS ---
 from fastapi.middleware.cors import CORSMiddleware
 
-ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
+origins = [o.strip() for o in os.getenv("ALLOW_ORIGINS", "*").split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOW_ORIGINS if o.strip()],
+    allow_origins=origins if origins else ["*"],
+    allow_methods=["*"],          # GET/POST/OPTIONS ecc.
+    allow_headers=["*"],          # lascia solo "*" (niente lista mista con "*")
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*", "Content-Type", "X-API-Key"],
     expose_headers=["*"],
     max_age=86400,
 )
+
 
 # --- API Key guard (opzionale) ---
 API_KEY = os.getenv("API_KEY")  # imposta su Render, es. 'supersegreta123'
