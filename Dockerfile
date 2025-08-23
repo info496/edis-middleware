@@ -1,19 +1,16 @@
-FROM python:3.11-slim
+# Base ufficiale Playwright per Python, versione 1.54.0 su Ubuntu Jammy
+FROM mcr.microsoft.com/playwright/python:v1.54.0-jammy
 
-ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-# requirements
+# Dipendenze Python dell'app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Installa Chromium e le librerie necessarie per Playwright
-RUN python -m playwright install --with-deps chromium
-
-# codice applicazione
+# Codice applicazione
 COPY . .
 
-# Render fornisce la porta in $PORT
+# Porta per Render
 ENV PORT=10000
 
 # Avvio
