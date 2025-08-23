@@ -3,4 +3,4 @@ uvicorn[standard]
 pandas
 python-dateutil
 requests
-playwright
+playwright==1.54.0
