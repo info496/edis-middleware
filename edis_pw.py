@@ -1,229 +1,309 @@
-import os
 import re
-import json
-import asyncio
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-
-
-class SessionMissingError(RuntimeError):
-    pass
+from playwright.async_api import Page, Frame, expect
 
 
-CURVES_URL = "https://private.e-distribuzione.it/PortaleClienti/s/curvedicarico"
-LOGIN_URL  = "https://private.e-distribuzione.it/PortaleClienti/s/login/?startURL=%2FPortaleClienti%2Fs%2Fcurvedicarico"
+CURVE_URL = "https://private.e-distribuzione.it/PortaleClienti/s/curvedicarico"
+LOGIN_URL = "https://private.e-distribuzione.it/PortaleClienti/s/login/"
 
-# Selettori “elastici” (testo può cambiare leggermente)
-CSV_BTN_REGEX = re.compile(r"scarica.*quarto", re.I)
-
-# Tentativi & timeout (puoi alzarli se la pagina è lenta)
-NAV_TIMEOUT   = 45_000
-CLICK_TIMEOUT = 20_000
-DL_TIMEOUT    = 60_000
+# pattern robusto: gestisce “Scarica il dettaglio del quarto d’ora” e “Download CSV”
+_DL_REGEX = re.compile(
+    r"(scarica(?:\s+il)?\s+(?:dettaglio\s+del\s+)?quarto\s+d[’'`]ora|download\s*csv)",
+    re.IGNORECASE,
+)
 
 
-async def _new_context(pw, use_storage: bool, headless: bool = True):
-    storage_state_path = os.getenv("STORAGE_STATE", "/app/storage_state.json")
-    if use_storage:
-        if not Path(storage_state_path).exists():
-            raise SessionMissingError(
-                "Sessione salvata non trovata. Esegui il bootstrap da locale e carica lo storage_state.json."
-            )
-        browser = await pw.chromium.launch(headless=headless, args=["--no-sandbox"])
-        context = await browser.new_context(storage_state=storage_state_path, accept_downloads=True)
-        return browser, context
+# ---------------------------------------------------------------------------
+# Utilità
+# ---------------------------------------------------------------------------
 
-    # senza sessione salvata
-    browser = await pw.chromium.launch(headless=headless, args=["--no-sandbox"])
-    context = await browser.new_context(accept_downloads=True)
-    return browser, context
-
-
-async def _maybe_login(context, username: Optional[str], password: Optional[str], log: List[str]):
+def _to_ddmmyyyy(s: str) -> str:
     """
-    Tenta il login se compaiono i campi nella pagina di login.
+    Converte '2025-08-24' -> '24/08/2025' oppure lascia invariato se già dd/mm/yyyy.
     """
-    page = await context.new_page()
-    await page.goto(LOGIN_URL, wait_until="load", timeout=NAV_TIMEOUT)
+    s = (s or "").strip()
+    if not s:
+        return s
+    if "/" in s:
+        return s  # già dd/mm/yyyy
+    # case 'YYYY-MM-DD'
+    parts = s.split("-")
+    if len(parts) == 3 and all(parts):
+        y, m, d = parts
+        return f"{d.zfill(2)}/{m.zfill(2)}/{y}"
+    return s
 
-    # Se i campi non ci sono vuol dire che siamo già loggati (sessione valida)
-    user_sel = "input[name='username'], input[type=email]"
-    pass_sel = "input[name='password'], input[type=password]"
 
+async def _set_text(loc, value: str):
+    """Se esiste, forza un valore in un input text."""
     try:
-        user_el = page.locator(user_sel)
-        pass_el = page.locator(pass_sel)
-        btn_el  = page.get_by_role("button", name=re.compile("accedi|login|entra", re.I))
-
-        # Se non ci sono i campi, passo oltre
-        if await user_el.count() == 0 or await pass_el.count() == 0:
-            await page.close()
-            return
-
-        if not username or not password:
-            await page.close()
-            raise SessionMissingError("Sessione scaduta e credenziali mancanti.")
-
-        await user_el.first.fill(username)
-        await pass_el.first.fill(password)
-        if await btn_el.count() > 0:
-            await btn_el.first.click(timeout=CLICK_TIMEOUT)
-        else:
-            # fallback generico
-            await page.keyboard.press("Enter")
-
-        # attendo redirect alla pagina delle curve
-        await page.wait_for_url(re.compile(r"/curvedicarico"), timeout=NAV_TIMEOUT)
-        await asyncio.sleep(1)
-    finally:
-        await page.close()
-
-
-async def _open_curves_page(context):
-    page = await context.new_page()
-    await page.goto(CURVES_URL, wait_until="load", timeout=NAV_TIMEOUT)
-    return page
-
-
-async def _set_filters_if_present(page, pod: str, date_from: str, date_to: str, log: List[str]):
-    """
-    Prova ad impostare POD e date se i campi sono presenti.
-    In caso contrario prosegue comunque (spesso non serve).
-    """
-    async def _fill(sel_list: list[str], value: str, label: str):
-        for sel in sel_list:
-            loc = page.locator(sel)
-            if await loc.count() > 0:
-                try:
-                    await loc.first.fill(value, timeout=CLICK_TIMEOUT)
-                    log.append(f"{label} impostato.")
-                    return True
-                except Exception:
-                    pass
-        log.append(f"ATTENZIONE: campo {label} non trovato (verifica selettori)")
-        return False
-
-    # Tenta POD
-    if pod:
-        await _fill(
-            [
-                "input[name='pod']",
-                "input[placeholder*='POD']",
-                "input[id*='pod']",
-            ],
-            pod, "POD"
-        )
-
-    # Tenta date
-    if date_from:
-        await _fill(
-            [
-                "input[type='date']#date_from",
-                "input[name='date_from']",
-                "input[placeholder*='Inizio']",
-            ],
-            date_from, "data inizio"
-        )
-    if date_to:
-        await _fill(
-            [
-                "input[type='date']#date_to",
-                "input[name='date_to']",
-                "input[placeholder*='Fine']",
-            ],
-            date_to, "data fine"
-        )
-
-
-async def _click_download_csv(page, log: List[str]) -> Tuple[str, list]:
-    """
-    Click su “Scarica il dettaglio del quarto d’ora” e ritorna CSV come testo e
-    un parsing basilare (rows).
-    """
-    # Prova vari modi: role button per accessibilità + fallback testuale
-    btn = page.get_by_role("button", name=CSV_BTN_REGEX)
-    if await btn.count() == 0:
-        # fallback: query generica per testo
-        btn = page.locator("button, a").filter(has_text=CSV_BTN_REGEX)
-
-    if await btn.count() == 0:
-        raise RuntimeError("Pulsante download CSV non trovato (verifica selettori)")
-
-    async with page.expect_download(timeout=DL_TIMEOUT) as dl_info:
-        await btn.first.click(timeout=CLICK_TIMEOUT)
-    download = await dl_info.value
-    csv_bytes = await download.content()
-    csv_text = csv_bytes.decode("utf-8", errors="replace")
-
-    # parse leggero -> rows: [{timestamp,kwh,quality}]
-    rows = []
-    try:
-        lines = [l for l in csv_text.splitlines() if l.strip()]
-        # salta header se presente
-        body = lines[1:] if "timestamp" in lines[0].lower() or "kwh" in lines[0].lower() else lines
-        for line in body:
-            cols = line.split(";") if ";" in line else line.split(",")
-            if len(cols) >= 2:
-                rows.append({
-                    "timestamp": cols[0].strip(),
-                    "kwh": cols[1].strip(),
-                    "quality": cols[2].strip() if len(cols) > 2 else ""
-                })
+        await loc.scroll_into_view_if_needed()
+        await loc.wait_for(state="visible", timeout=4000)
+        await loc.click()
+        # seleziona tutto e sovrascrivi
+        await loc.fill("")  # per sicurezza
+        await loc.type(value, delay=10)
     except Exception:
         pass
 
-    return csv_text, rows
+
+# ---------------------------------------------------------------------------
+# Frame e selettori
+# ---------------------------------------------------------------------------
+
+async def _find_curve_frame(page: Page) -> Frame:
+    """
+    Trova il frame “giusto” che contiene la pagina Curve di Carico.
+    Priorità a URL contenente 'curvedicarico' oppure title 'Curve di carico'.
+    """
+    # prima prova: frame attuale se punta già alla pagina
+    for fr in page.frames:
+        url = (fr.url or "").lower()
+        try:
+            title = ((await fr.title()) or "").lower()
+        except Exception:
+            title = ""
+        if "curvedicarico" in url or "curve di carico" in title:
+            return fr
+
+    # fallback: main frame
+    return page.main_frame
 
 
-async def refresh_and_download_csv_async(
+async def _find_download_button(frame: Frame):
+    """
+    Cerca pulsante/ancora 'Scarica il dettaglio del quarto d’ora' / 'Download CSV'
+    con varie strategie robuste.
+    """
+    candidates = [
+        frame.get_by_role("button", name=_DL_REGEX),
+        frame.get_by_role("link", name=_DL_REGEX),
+        frame.locator("button", has_text=_DL_REGEX),
+        frame.locator("a", has_text=_DL_REGEX),
+        # classi Salesforce ricorrenti
+        frame.locator("button.slds-button_brand"),
+        frame.locator("button.slds-button.slds-button_brand.slds-float_right"),
+    ]
+
+    for loc in candidates:
+        try:
+            count = await loc.count()
+        except Exception:
+            continue
+        for i in range(count):
+            el = loc.nth(i)
+            try:
+                txt = (await el.inner_text()).strip().lower()
+            except Exception:
+                continue
+            if _DL_REGEX.search(txt):
+                try:
+                    await el.scroll_into_view_if_needed()
+                    await el.wait_for(state="visible", timeout=5000)
+                except Exception:
+                    pass
+                return el
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Compilazione filtri (best effort — non blocca se i campi non esistono)
+# ---------------------------------------------------------------------------
+
+async def _fill_filters_best_effort(
+    frame: Frame, pod: str, date_from: str, date_to: str, log: list
+):
+    """Prova a compilare POD e date. Se i campi non ci sono, logga e prosegue."""
+    dfrom = _to_ddmmyyyy(date_from)
+    dto = _to_ddmmyyyy(date_to)
+
+    # POD
+    try:
+        pod_loc = (
+            frame.get_by_label(re.compile("pod", re.I))
+            .or_(frame.get_by_placeholder(re.compile("pod", re.I)))
+            .or_(frame.locator("input[name*='pod' i]"))
+        )
+        if await pod_loc.count():
+            await _set_text(pod_loc.first, pod)
+        else:
+            log.append("ATTENZIONE: campo POD non trovato (best effort)")
+    except Exception:
+        log.append("ATTENZIONE: campo POD non trovato (best effort)")
+
+    # date from
+    try:
+        df_loc = (
+            frame.get_by_label(re.compile("inizio|da|from", re.I))
+            .or_(frame.get_by_placeholder(re.compile(r"\d{2}/\d{2}/\d{4}")))
+        )
+        if await df_loc.count():
+            await _set_text(df_loc.first, dfrom)
+        else:
+            log.append("ATTENZIONE: campo data inizio non trovato (best effort)")
+    except Exception:
+        log.append("ATTENZIONE: campo data inizio non trovato (best effort)")
+
+    # date to
+    try:
+        dt_loc = (
+            frame.get_by_label(re.compile("fine|a|to", re.I))
+            .or_(frame.get_by_placeholder(re.compile(r"\d{2}/\d{2}/\d{4}")))
+        )
+        if await dt_loc.count():
+            await _set_text(dt_loc.first, dto)
+        else:
+            log.append("ATTENZIONE: campo data fine non trovato (best effort)")
+    except Exception:
+        log.append("ATTENZIONE: campo data fine non trovato (best effort)")
+
+
+# ---------------------------------------------------------------------------
+# Login best-effort (solo se non si usa storage; soggetto a captcha)
+# ---------------------------------------------------------------------------
+
+async def _maybe_login(page: Page, username: str, password: str, log: list) -> bool:
+    """
+    Se siamo sulla pagina di login, prova a loggarsi. Ritorna True se pensa di esserci riuscito.
+    NB: il sito può richiedere captcha => non garantito.
+    """
+    try:
+        url = page.url.lower()
+    except Exception:
+        url = ""
+
+    if "login" not in url:
+        return True  # non sembra in login
+
+    if not username or not password:
+        log.append("Sei in login ma non hai username/password: impossibile procedere.")
+        return False
+
+    log.append("Sono in login: provo a compilare le credenziali…")
+
+    # campi possibili
+    user_loc = (
+        page.get_by_label(re.compile("email|user|username", re.I))
+        .or_(page.get_by_placeholder(re.compile("email|user", re.I)))
+        .or_(page.locator("input[type='email'], input[name*='user' i]"))
+    )
+    pass_loc = (
+        page.get_by_label(re.compile("password", re.I))
+        .or_(page.get_by_placeholder(re.compile("password", re.I)))
+        .or_(page.locator("input[type='password']"))
+    )
+
+    try:
+        if await user_loc.count():
+            await _set_text(user_loc.first, username)
+        if await pass_loc.count():
+            await _set_text(pass_loc.first, password)
+        # bottone “Accedi” / “Login”
+        accedi = page.get_by_role("button", name=re.compile("accedi|login|entra", re.I))
+        if not await accedi.count():
+            accedi = page.locator("button.slds-button_brand")
+        if await accedi.count():
+            async with page.expect_navigation():
+                await accedi.first.click()
+        else:
+            # prova Invio direttamente sul campo password
+            if await pass_loc.count():
+                await pass_loc.first.press("Enter")
+                await page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+
+    # verifica “grossolana”: se URL contiene curvedicarico
+    await page.wait_for_load_state("domcontentloaded", timeout=20000)
+    ok = "curvedicarico" in page.url.lower()
+    if ok:
+        log.append("Login completato.")
+    else:
+        log.append("Login fallito o bloccato da captcha.")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Funzione principale invocata da main.py
+# ---------------------------------------------------------------------------
+
+async def refresh_and_download_csv(
+    page: Page,
     pod: str,
     date_from: str,
     date_to: str,
     use_storage: bool,
-    username: Optional[str] = None,
-    password: Optional[str] = None,
-) -> Tuple[str, list, List[str]]:
+    username: str = "",
+    password: str = "",
+    download_dir: Optional[Path] = None,
+) -> Path:
     """
-    Funzione principale completamente **async**.
-    Ritorna: (csv_text, rows, log)
+    Naviga a 'Curve di Carico', imposta (best effort) POD e date, clicca il pulsante
+    “Scarica il dettaglio del quarto d’ora” / “Download CSV” e ritorna il path del file.
+
+    Parametri:
+      - page: Page async già aperta (il contesto può essere con storage state).
+      - use_storage: se True si assume che l’utente sia già autenticato.
+      - username/password: usati solo se use_storage=False (login best effort).
     """
-    log: List[str] = []
-    log.append("=== refresh_and_download_csv: start ===")
+    log: list[str] = []
 
-    # NB: usare SEMPRE Async API
-    async with async_playwright() as pw:
-        browser, context = await _new_context(pw, use_storage=use_storage, headless=True)
+    # 1) vai alla pagina “curve di carico”
+    await page.goto(CURVE_URL, wait_until="domcontentloaded")
+    await page.wait_for_load_state("networkidle")
 
+    # 2) se risulto in una pagina di login, prova a loggarti (solo se non usi storage)
+    if not use_storage and "login" in page.url.lower():
+        ok = await _maybe_login(page, username, password, log)
+        if not ok:
+            raise RuntimeError("Login non riuscito (probabile reCAPTCHA).")
+
+        # dopo login torna alla pagina curve
+        await page.goto(CURVE_URL, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle")
+
+    # 3) trova frame
+    frame = await _find_curve_frame(page)
+
+    # 4) scorri verso il basso (il bottone è spesso in fondo a dx)
+    try:
+        await frame.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await frame.wait_for_timeout(400)
+    except Exception:
+        pass
+
+    # 5) compila filtri (best effort)
+    await _fill_filters_best_effort(frame, pod=pod, date_from=date_from, date_to=date_to, log=log)
+
+    # 6) trova pulsante download
+    btn = await _find_download_button(frame)
+    if not btn:
+        # un altro tentativo dopo scroll up
         try:
-            # login se serve (solo quando non usi storage/salvata)
-            if not use_storage:
-                await _maybe_login(context, username, password, log)
+            await frame.evaluate("window.scrollTo(0, 0)")
+            await frame.wait_for_timeout(300)
+        except Exception:
+            pass
+        btn = await _find_download_button(frame)
 
-            # Apri pagina curve
-            page = await _open_curves_page(context)
+    if not btn:
+        raise RuntimeError("Pulsante download CSV non trovato (verifica selettori)")
 
-            # Prova ad impostare filtri (best effort)
-            await _set_filters_if_present(page, pod, date_from, date_to, log)
+    # 7) configurazione cartella download
+    if download_dir is None:
+        download_dir = Path("/tmp")
+    download_dir.mkdir(parents=True, exist_ok=True)
 
-            # Esegui Download
-            csv_text, rows = await _click_download_csv(page, log)
-            log.append("Download CSV completato.")
+    safe_from = _to_ddmmyyyy(date_from).replace("/", "-")
+    safe_to = _to_ddmmyyyy(date_to).replace("/", "-")
+    out_path = download_dir / f"curve_{pod}_{safe_from}_{safe_to}.csv"
 
-            # Se hai appena fatto login, aggiorna la sessione salvata
-            if not use_storage:
-                storage_state_path = os.getenv("STORAGE_STATE", "/app/storage_state.json")
-                # salva storage per i prossimi run
-                try:
-                    await context.storage_state(path=storage_state_path)
-                    log.append(f"Sessione salvata in {storage_state_path}")
-                except Exception as e:
-                    log.append(f"Salvataggio sessione fallito: {e}")
+    # 8) click con attesa del download reale
+    async with page.expect_download() as dl_info:
+        await btn.click()
+    dl = await dl_info.value
+    await dl.save_as(out_path.as_posix())
 
-            return csv_text, rows, log
-
-        finally:
-            await context.close()
-            await browser.close()
-            log.append("=== refresh_and_download_csv: end ===")
+    return out_path
