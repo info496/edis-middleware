@@ -1,151 +1,206 @@
 # main.py
+from __future__ import annotations
+
 import os
 import json
-from typing import List, Optional
-from datetime import datetime
+from pathlib import Path
+from typing import Optional, List
 
-import pandas as pd
-from fastapi import FastAPI, HTTPException, Header, Request, Depends, Body, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
-from pydantic import BaseModel, Field
 import anyio
+import pandas as pd
+from fastapi import FastAPI, Depends, Header, HTTPException, status, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from starlette.responses import PlainTextResponse, JSONResponse, FileResponse
 
-from edis_pw import refresh_and_download_csv
+from edis_pw import refresh_and_download_csv  # <-- il tuo modulo Playwright
 
-# ------------------------------------------------------------
-# Config da ambiente
-# ------------------------------------------------------------
-API_KEY = os.getenv("API_KEY", "")
-ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
-PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "90000"))  # 90s default
+# -----------------------------------------------------------------------------
+# Configurazione
+# -----------------------------------------------------------------------------
 
-CACHE_DIR = os.getenv("CACHE_DIR", "/app/cache")
-CSV_CACHE_PATH = os.path.join(CACHE_DIR, "edis_quartorario.csv")
+API_TITLE = "e-Distribuzione CSV Middleware"
+API_VERSION = "1.0"
+
+CACHE_DIR = Path("storage")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# CORS
+_allow = os.getenv("ALLOW_ORIGINS", "*")
+ALLOW_ORIGINS = [x.strip() for x in _allow.split(",")] if _allow else ["*"]
+
+# API-Key
+API_KEY = os.getenv("API_KEY", "").strip()
+
+# Timeout Playwright (millisecondi)
+try:
+    PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "90000"))
+except ValueError:
+    PW_TIMEOUT_MS = 90000
+
+# Percorso storage_state (solo per /diag)
 STORAGE_STATE = os.getenv("STORAGE_STATE", "/app/storage_state.json")
 
-os.makedirs(CACHE_DIR, exist_ok=True)
+app = FastAPI(title=API_TITLE, version=API_VERSION)
 
-# ------------------------------------------------------------
-# App & CORS
-# ------------------------------------------------------------
-app = FastAPI(title="e-Distribuzione CSV Middleware", version="1.0")
-
-origins: List[str] = [o.strip() for o in ALLOW_ORIGINS.split(",")] if ALLOW_ORIGINS else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o for o in origins if o],  # evita stringhe vuote
+    allow_origins=ALLOW_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*", "X-API-Key"],
-    expose_headers=["*", "X-API-Key"],
+    allow_headers=["*"],
+    expose_headers=["*"],
     max_age=86400,
 )
 
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Sicurezza semplice via Header API Key
+# -----------------------------------------------------------------------------
+def api_key_guard(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    if not API_KEY:
+        # Nessuna chiave impostata lato server -> disattivo il controllo
+        return
+    if x_api_key != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key non valida",
+        )
+
+# -----------------------------------------------------------------------------
 # Modelli
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
 class RefreshPayload(BaseModel):
-    username: Optional[str] = Field(default=None, description="Ignorato se use_storage=True (reCAPTCHA)")
-    password: Optional[str] = Field(default=None, description="Ignorato se use_storage=True (reCAPTCHA)")
-    pod: str
-    date_from: str = Field(description="Formati ammessi: YYYY-MM-DD oppure DD/MM/YYYY")
-    date_to: str = Field(description="Formati ammessi: YYYY-MM-DD oppure DD/MM/YYYY")
-    use_storage: bool = Field(default=True, description="Usa cookie salvati in STORAGE_STATE (consigliato)")
+    username: Optional[str] = Field(None, description="Username portale eDistribuzione")
+    password: Optional[str] = Field(None, description="Password portale eDistribuzione")
+    pod: str = Field(..., description="Codice POD")
+    date_from: str = Field(..., description="YYYY-MM-DD")
+    date_to: str = Field(..., description="YYYY-MM-DD")
+    use_storage: bool = Field(False, description="Usa storage_state esistente")
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def check_api_key(x_api_key: Optional[str] = Header(None)):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+# -----------------------------------------------------------------------------
+# Utility
+# -----------------------------------------------------------------------------
+def _cache_basename(pod: str, date_from: str, date_to: str) -> str:
+    safe_pod = pod.replace("/", "_")
+    return f"{safe_pod}_{date_from}_{date_to}"
 
-def _csv_exists() -> bool:
-    return os.path.exists(CSV_CACHE_PATH) and os.path.getsize(CSV_CACHE_PATH) > 0
+def _csv_path(pod: str, date_from: str, date_to: str) -> Path:
+    return CACHE_DIR / f"{_cache_basename(pod, date_from, date_to)}.csv"
 
-def _parse_csv_to_json(path: str) -> list:
-    if not os.path.exists(path):
-        raise FileNotFoundError("CSV cache non presente")
+def _json_path(pod: str, date_from: str, date_to: str) -> Path:
+    return CACHE_DIR / f"{_cache_basename(pod, date_from, date_to)}.json"
 
-    # Proviamo prima con ; poi con ,
-    try:
-        df = pd.read_csv(path, sep=";", engine="python")
-        # Se ha una sola colonna gigante con ; dentro, riprova con ,
-        if df.shape[1] == 1 and ";" in df.columns[0]:
-            raise Exception("semicolon wrong")
-    except Exception:
-        df = pd.read_csv(path, sep=",", engine="python")
+def _csv_to_json(csv_file: Path) -> List[dict]:
+    """
+    Converte il CSV di e-Distribuzione in un JSON semplice:
+    [
+      {"timestamp": "...", "kwh_15": <float>, "quality": "..."},
+      ...
+    ]
+    """
+    # Prova a leggere con pandas (separatore ; tipico)
+    df = pd.read_csv(csv_file, sep=";", engine="python")
+    # Normalizza possibili colonne
+    cols = [c.lower().strip() for c in df.columns]
+    df.columns = cols
 
-    # Normalizzazioni soft (non obbligatorie)
-    # Prova a uniformare nomi colonne noti
-    cols = {c.lower().strip(): c for c in df.columns}
-    # Esempio tipico: "Timestamp", "kWh (15’)", "Quality"
-    # Lasciamo invariato se diverso: non conosciamo sempre l'esatto layout
-
-    # Converti eventuale colonna Timestamp in ISO string
-    for c in df.columns:
-        if "time" in c.lower():
-            try:
-                df[c] = pd.to_datetime(df[c], dayfirst=True, errors="coerce").astype("datetime64[ns]")
-                df[c] = df[c].dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
+    # Cerco colonne "timestamp", "energia attiva", "quality" (adatta se necessario)
+    # Alcuni export usano "data/ora" o "timestamp", altri "energia attiva (kwh)"
+    ts_col = None
+    for c in ("timestamp", "data/ora", "data ora", "data_ora"):
+        if c in df.columns:
+            ts_col = c
             break
 
-    # NaN -> None
-    data = json.loads(df.to_json(orient="records", date_format="iso"))
-    return data
+    kwh_col = None
+    for c in ("energia attiva (kwh)", "energia attiva", "kwh", "kwh (15')", "kwh (15m)"):
+        if c in df.columns:
+            kwh_col = c
+            break
 
-def _fmt_error(msg: str) -> JSONResponse:
-    return JSONResponse(status_code=500, content={"detail": msg})
+    quality_col = None
+    for c in ("quality", "qualita", "qualità", "stato", "flag"):
+        if c in df.columns:
+            quality_col = c
+            break
 
-# ------------------------------------------------------------
-# Rotte
-# ------------------------------------------------------------
+    if ts_col is None or kwh_col is None:
+        # Se non trovo colonne, restituisco JSON grezzo dal CSV
+        return df.to_dict(orient="records")
+
+    out = []
+    for _, row in df.iterrows():
+        out.append(
+            {
+                "timestamp": str(row.get(ts_col, "")),
+                "kwh_15": (
+                    float(str(row.get(kwh_col)).replace(",", "."))
+                    if pd.notna(row.get(kwh_col))
+                    else None
+                ),
+                "quality": (row.get(quality_col) if quality_col else None),
+            }
+        )
+    return out
+
+def _ensure_json_cache(csv_file: Path, json_file: Path) -> None:
+    if not json_file.exists():
+        data = _csv_to_json(csv_file)
+        json_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
 @app.get("/healthz", response_class=PlainTextResponse)
-async def healthz():
+def healthz():
     return "ok"
 
 @app.get("/diag")
-async def diag():
-    exists = os.path.exists(STORAGE_STATE)
-    size = os.path.getsize(STORAGE_STATE) if exists else 0
-    # Contiamo cookie/origini sommariamente
-    head = {}
-    if exists:
-        try:
-            with open(STORAGE_STATE, "r", encoding="utf-8") as f:
-                # non parseiamo tutto: basta il "riassunto"
-                txt = f.read(2048)
-            # non è affidabile al 100% ma dà un'idea
-            head = {"preview": txt[:200]}
-        except Exception:
-            pass
-    return {
+def diag():
+    # piccola diagnostica utile
+    info = {
         "version": "diag-1",
         "storage_state_path": STORAGE_STATE,
-        "exists": exists,
-        "size_bytes": size,
-        "head": head,
-        "allow_origins": origins,
+        "exists": Path(STORAGE_STATE).exists(),
+        "size_bytes": Path(STORAGE_STATE).stat().st_size if Path(STORAGE_STATE).exists() else 0,
+        "head": {},
+        "allow_origins": ALLOW_ORIGINS,
     }
+    if Path(STORAGE_STATE).exists():
+        try:
+            raw = json.loads(Path(STORAGE_STATE).read_text(encoding="utf-8"))
+            cookies = raw.get("cookies", [])
+            origins = raw.get("origins", [])
+            info["head"] = {
+                "cookies_count": len(cookies),
+                "origins_count": len(origins),
+            }
+        except Exception:
+            pass
+    return info
 
-@app.post("/refresh")
-async def refresh(
-    payload: RefreshPayload = Body(...),
-    _: None = Depends(check_api_key),
-):
+@app.post("/refresh", dependencies=[Depends(api_key_guard)])
+async def refresh(payload: RefreshPayload):
     """
-    Scarica dal portale (preferibilmente con `use_storage: true`),
-    cerca il bottone 'CSV' e salva in cache.
+    Avvia Playwright:
+    - se use_storage=True usa la sessione salvata (storage_state) e NON richiede credenziali;
+    - altrimenti richiede username e password.
+    Alla fine crea/aggiorna i file cache CSV + JSON.
     """
-    # Logging "soft"
-    def log(msg: str):
-        print("[refresh]", msg)
+    log: List[str] = []
 
+    if not payload.use_storage:
+        if not payload.username or not payload.password:
+            raise HTTPException(
+                status_code=400,
+                detail="username/password mancanti",
+            )
+
+    csv_file = _csv_path(payload.pod, payload.date_from, payload.date_to)
+    json_file = _json_path(payload.pod, payload.date_from, payload.date_to)
     try:
-        # Timeout globale per Playwright
-        async with anyio.fail_after(PW_TIMEOUT_MS / 1000.0):
+        # ✅ CORRETTO: context manager sincrono
+        with anyio.fail_after(PW_TIMEOUT_MS / 1000.0):
             path = await refresh_and_download_csv(
                 username=payload.username,
                 password=payload.password,
@@ -156,65 +211,73 @@ async def refresh(
                 log=log,
             )
 
-        if not os.path.exists(path):
-            raise RuntimeError("Download CSV completato ma file non presente")
+        # Sposta/normalizza il file scaricato nella cache attesa
+        downloaded = Path(path)
+        if not downloaded.exists():
+            raise RuntimeError("Download CSV non trovato")
 
-        return {"status": "ok", "csv_path": path}
+        if downloaded.resolve() != csv_file.resolve():
+            csv_file.write_bytes(downloaded.read_bytes())
 
-    except TimeoutError:
-        return _fmt_error("Timeout")
+        # prepara JSON cache
+        _ensure_json_cache(csv_file, json_file)
+
+        return {
+            "ok": True,
+            "csv": f"/csv?pod={payload.pod}&date_from={payload.date_from}&date_to={payload.date_to}",
+            "json": f"/data?pod={payload.pod}&date_from={payload.date_from}&date_to={payload.date_to}",
+            "log": log,
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        # Errori "parlanti" già gestiti da edis_pw.py
-        return _fmt_error(str(e))
+        # Errore lato scraping/download
+        return JSONResponse(
+            status_code=500,
+            content={"detail": str(e), "log": log},
+        )
 
-@app.get("/download/csv")
-async def download_csv(
-    _: None = Depends(check_api_key),
+@app.get("/data", dependencies=[Depends(api_key_guard)])
+def get_data(
+    pod: str = Query(...),
+    date_from: str = Query(...),
+    date_to: str = Query(...),
 ):
-    """
-    Ritorna il CSV di cache generato da /refresh.
-    """
-    if not _csv_exists():
-        raise HTTPException(status_code=404, detail="CSV non trovato; esegui prima /refresh")
-    fname = f"edis_quartorario_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    return FileResponse(CSV_CACHE_PATH, filename=fname, media_type="text/csv")
+    json_file = _json_path(pod, date_from, date_to)
+    csv_file = _csv_path(pod, date_from, date_to)
 
-@app.get("/data")
-async def data(
-    _: None = Depends(check_api_key),
-    # (Opzionali) Filtri lato API se vuoi
-    date_from: Optional[str] = Query(None),
-    date_to: Optional[str] = Query(None),
-):
-    """
-    Ritorna i dati del CSV in JSON. Per filtri precisi conviene filtrare lato client,
-    perché il layout dei CSV può variare.
-    """
-    if not _csv_exists():
-        raise HTTPException(status_code=404, detail="CSV non trovato; esegui prima /refresh")
+    if not json_file.exists():
+        if not csv_file.exists():
+            raise HTTPException(status_code=404, detail="Cache assente. Esegui /refresh.")
+        _ensure_json_cache(csv_file, json_file)
 
     try:
-        records = _parse_csv_to_json(CSV_CACHE_PATH)
+        data = json.loads(json_file.read_text(encoding="utf-8"))
+        return {"ok": True, "count": len(data), "items": data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Errore lettura CSV: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # Filtrino leggero sulla colonna che contiene il tempo (se esiste)
-    if date_from or date_to:
-        df = pd.DataFrame(records)
-        time_col = None
-        for c in df.columns:
-            if "time" in c.lower():
-                time_col = c
-                break
-        if time_col:
-            try:
-                df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
-                if date_from:
-                    df = df[df[time_col] >= pd.to_datetime(date_from, errors="coerce")]
-                if date_to:
-                    df = df[df[time_col] <= pd.to_datetime(date_to, errors="coerce")]
-                records = json.loads(df.to_json(orient="records", date_format="iso"))
-            except Exception:
-                pass
+@app.get("/csv", response_class=FileResponse, dependencies=[Depends(api_key_guard)])
+def get_csv(
+    pod: str = Query(...),
+    date_from: str = Query(...),
+    date_to: str = Query(...),
+):
+    csv_file = _csv_path(pod, date_from, date_to)
+    if not csv_file.exists():
+        raise HTTPException(status_code=404, detail="CSV non presente. Esegui /refresh.")
 
-    return {"rows": records, "count": len(records)}
+    filename = f"{_cache_basename(pod, date_from, date_to)}.csv"
+    return FileResponse(
+        csv_file,
+        media_type="text/csv; charset=utf-8",
+        filename=filename,
+    )
+
+# -----------------------------------------------------------------------------
+# Avvio locale (non usato su Render, dove parte via start.sh / gunicorn)
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=True)
