@@ -1,13 +1,13 @@
-# Base ufficiale Playwright per Python, versione 1.54.0 su Ubuntu Jammy
-FROM mcr.microsoft.com/playwright/python:v1.54.0-jammy
+# Base con Chromium già installato
+FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
 WORKDIR /app
 
-# Dipendenze Python dell'app
+# Dipendenze Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Codice applicazione
+# Codice
 COPY . .
 
 # Porta per Render
