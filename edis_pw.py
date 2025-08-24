@@ -1,358 +1,161 @@
 # edis_pw.py
 from __future__ import annotations
+import os, io, csv, re, json, time
+from typing import List, Dict, Any, Optional
+from playwright.sync_api import Playwright, sync_playwright, TimeoutError as PWTimeout
 
-import os
-import re
-from pathlib import Path
-from typing import Optional, Callable, Union, Iterable
+E_URL = "https://private.e-distribuzione.it/PortaleClienti/s/curvedicarico"
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
+# collezionatore log semplice
+class Logger(list):
+    def write(self, msg: str) -> None:
+        msg = str(msg).rstrip()
+        if msg:
+            self.append(msg)
 
-# -----------------------------------------------------------------------------
-# Config da env
-# -----------------------------------------------------------------------------
+def _human_selector_list(locs: List[str]) -> str:
+    return " | ".join(locs)
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-PW_TIMEOUT_MS = _env_int("PW_TIMEOUT_MS", 90000)
-STORAGE_STATE = os.getenv("STORAGE_STATE", "/app/storage_state.json")
-DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/tmp/edis_downloads"))
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-BASE_URL = "https://private.e-distribuzione.it/PortaleClienti/s"
-# In genere “curvedicarico” o simile. Se cambia, basta aggiornare questa costante.
-CURVE_URL = f"{BASE_URL}/curvedicarico"
-
-# -----------------------------------------------------------------------------
-# Log helper (accetta callable, lista o None)
-# -----------------------------------------------------------------------------
-
-def _mklog(log: Optional[Union[Callable[[str], None], list]]):
-    if callable(log):
-        return log
-    if isinstance(log, list):
-        def _f(msg: str):
-            try:
-                log.append(str(msg))
-            except Exception:
-                pass
-        return _f
-    def _noop(_msg: str):
-        return
-    return _noop
-
-# -----------------------------------------------------------------------------
-# Util
-# -----------------------------------------------------------------------------
-
-def _to_portal_date(yyyy_mm_dd: str) -> str:
-    """YYYY-MM-DD -> DD/MM/YYYY (accettata normalmente dal portale)"""
-    parts = yyyy_mm_dd.split("-")
-    if len(parts) == 3:
-        y, m, d = parts
-        return f"{d}/{m}/{y}"
-    return yyyy_mm_dd
-
-async def _fill(locator, value: str):
-    await locator.click()
-    try:
-        await locator.fill("")
-    except Exception:
-        await locator.press("Control+A")
-        await locator.press("Delete")
-    await locator.type(value, delay=20)
-
-async def _first_count(frame, selector: str) -> int:
-    try:
-        return await frame.locator(selector).count()
-    except Exception:
-        return 0
-
-async def _click_if_any(frame, selectors: Iterable[str], timeout: int) -> bool:
-    for sel in selectors:
-        try:
-            loc = frame.locator(sel)
-            if await loc.count() > 0:
-                await loc.first().click(timeout=timeout)
-                return True
-        except Exception:
-            pass
-    return False
-
-async def _fill_first_available(frame, value: str, selectors: Iterable[str]) -> bool:
-    for sel in selectors:
-        loc = frame.locator(sel)
-        try:
-            if await loc.count() > 0:
-                await _fill(loc.first(), value)
-                return True
-        except Exception:
-            pass
-    return False
-
-# -----------------------------------------------------------------------------
-# Frame discovery: trova il frame che contiene i controlli di POD/CSV
-# -----------------------------------------------------------------------------
-
-async def _pick_work_frame(page, log) -> "Frame":
-    await page.wait_for_load_state("domcontentloaded")
-    frames = page.frames
-    log(f"Frame totali: {len(frames)}")
-
-    # pattern testuali tipici
-    pat_pod = re.compile(r"\bPOD\b|\bCodice\s*POD\b", re.I)
-    pat_csv = re.compile(r"Download\s*CSV|Scarica\s*CSV", re.I)
-
-    best = None
-    best_score = -1
-
-    for fr in frames:
-        score = 0
-        try:
-            # prova: match su inner text (veloce ma non sempre permesso)
-            txt = (await fr.title()) or ""
-            url = fr.url or ""
-            # punteggio base se l'URL fa pensare alla pagina corretta
-            if "curvedicarico" in url.lower():
-                score += 2
-
-            # euristiche: conta occorrenze di scritte POD/CSV
-            c1 = await fr.locator(f"text=/{pat_pod.pattern}/i").count()
-            c2 = await fr.locator(f"text=/{pat_csv.pattern}/i").count()
-            score += c1 + c2
-
-            # se non ha nulla, prova a cercare input tipici
-            if score == 0:
-                c3 = await fr.locator("input[name*='pod'], #pod, input[placeholder*='POD']").count()
-                c4 = await fr.locator("button:has-text('CSV'), a:has-text('CSV')").count()
-                score += c3 + c4
-
-            log(f"- Frame url={url!r} title={txt!r} -> score={score} (POD={c1 if 'c1' in locals() else '?'} CSV={c2 if 'c2' in locals() else '?'})")
-        except Exception as e:
-            log(f"- Frame error: {e}")
-
-        if score > best_score:
-            best_score = score
-            best = fr
-
-    if best is None:
-        # fallback al main frame, comunque
-        log("Nessun frame 'migliore' trovato; uso page.main_frame")
-        return page.main_frame
-
-    log(f"Frame scelto url={best.url!r} score={best_score}")
-    return best
-
-# -----------------------------------------------------------------------------
-# Flusso principale
-# -----------------------------------------------------------------------------
-
-async def refresh_and_download_csv(
-    *,
-    username: Optional[str],
-    password: Optional[str],
-    pod: str,
-    date_from: str,
-    date_to: str,
-    use_storage: bool,
-    log: Optional[Union[Callable[[str], None], list]] = None,
-) -> str:
+def refresh_and_download_csv(
+    storage_state_path: str,
+    out_dir: str = "/app/tmp",
+    headless: bool = True,
+    timeout_ms: int = 45000,
+) -> Dict[str, Any]:
     """
-    Scarica il CSV da e-Distribuzione. Ritorna il path assoluto del file scaricato.
+    Apre la pagina Curve di carico con la sessione salvata e clicca sul bottone
+    “Scarica il dettaglio del quarto d’ora”, intercettando il download CSV.
+    Ritorna: { ok, csv_path, rows, log }
     """
-    log = _mklog(log)
-    log("=== refresh_and_download_csv: start ===")
+    os.makedirs(out_dir, exist_ok=True)
 
-    if use_storage and not Path(STORAGE_STATE).exists():
-        raise RuntimeError("Sessione salvata richiesta ma storage_state non trovato")
-    if not use_storage and (not username or not password):
-        raise RuntimeError("Username/password mancanti e use_storage=False")
+    log = Logger()
+    log.write("=== refresh_and_download_csv: start ===")
 
-    df = _to_portal_date(date_from)
-    dt = _to_portal_date(date_to)
+    # Se non esiste lo storage -> errore esplicativo
+    if not os.path.exists(storage_state_path):
+        return {"ok": False, "detail": f"storage_state non trovato: {storage_state_path}", "log": log}
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
-        ctx_kwargs = {"accept_downloads": True}
-        if use_storage and Path(STORAGE_STATE).exists():
-            ctx_kwargs["storage_state"] = STORAGE_STATE
+    # Selettori robusti per il bottone di download
+    DL_SELECTORS = [
+        # testuale più probabile sulla tua pagina
+        "button:has-text('Scarica il dettaglio del quarto d\\'ora')",
+        "button:has-text('Scarica il dettaglio del quarto d’ora')",  # apostrofo tipografico
+        # fallback generici
+        "button:has-text('Scarica')",
+        "button.slds-button_brand.slds-float_right",
+        "button.slds-button_brand",
+        "button:has-text('CSV')",
+    ]
+    log.write(f"Selettori download (ordine): {_human_selector_list(DL_SELECTORS)}")
 
-        context = await browser.new_context(**ctx_kwargs)
-        context.set_default_timeout(PW_TIMEOUT_MS)
-        page = await context.new_page()
-        page.set_default_timeout(PW_TIMEOUT_MS)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
+        ctx = browser.new_context(storage_state=storage_state_path, accept_downloads=True)
+        page = ctx.new_page()
 
         try:
-            # Login solo se non uso storage
-            if not use_storage:
-                log("Navigo al login…")
-                await page.goto(BASE_URL, wait_until="domcontentloaded")
+            log.write(f"Apro URL: {E_URL}")
+            page.goto(E_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+            time.sleep(1.0)
 
-                # username/password
-                user_selectors = ["input[name='username']", "#username", "input[placeholder*='mail']"]
-                pass_selectors = ["input[name='password']", "#password", "input[type='password']"]
+            # Trova il frame che contiene la UI (titolo ‘Curve di carico’)
+            target = None
+            frames = page.frames
+            log.write(f"Frame totali: {len(frames)}")
+            for f in frames:
+                url = f.url or ""
+                title = (f.title() or "")
+                score = 0
+                if "curvedicarico" in url:
+                    score += 2
+                if "Curve di carico" in title or "Curva di carico" in title:
+                    score += 1
+                log.write(f"- Frame url='{url}' title='{title}' -> score={score}")
+                if score >= 2 and target is None:
+                    target = f
+            if target is None:
+                target = page.main_frame
+                log.write("ATTENZIONE: frame ‘curvedicarico’ non trovato, uso main_frame")
 
-                await _fill_first_available(page, username, user_selectors)
-                await _fill_first_available(page, password, pass_selectors)
-
-                # bottone
-                await _click_if_any(
-                    page,
-                    [
-                        "button:has-text('Accedi')",
-                        "button:has-text('Login')",
-                        "input[type='submit']",
-                    ],
-                    timeout=PW_TIMEOUT_MS,
-                )
-                try:
-                    await page.wait_for_url("**/PortaleClienti/**", timeout=PW_TIMEOUT_MS)
-                except PWTimeoutError:
-                    pass
-
-                try:
-                    await context.storage_state(path=STORAGE_STATE)
-                    log(f"Storage state salvato in {STORAGE_STATE}")
-                except Exception as e:
-                    log(f"Salvataggio storage state fallito: {e}")
-
-            # Pagina curve
-            log("Apro la pagina Curve di Carico…")
-            await page.goto(CURVE_URL, wait_until="domcontentloaded")
+            # Debug: stampa tutti i bottoni visibili per aiutare il tuning
             try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
+                btn_texts = target.locator("button").all_inner_texts()
+                sample = btn_texts[:10]
+                log.write(f"Bottoni visibili: {len(btn_texts)}  (prime 10) -> {sample}")
+            except Exception as e:
+                log.write(f"[debug] errore lettura bottoni: {e}")
 
-            # Trova frame “utile”
-            work = await _pick_work_frame(page, log)
-
-            # --- Compila POD ---
-            filled_pod = await _fill_first_available(
-                work,
-                pod,
-                [
-                    "input[name*='pod']",
-                    "#pod",
-                    "input[placeholder*='POD']",
-                    "input[aria-label*='POD']",
-                    "input:below(:text('POD'))",
-                ],
-            )
-            log(f"POD filled={filled_pod}")
-
-            # --- Data inizio ---
-            filled_from = await _fill_first_available(
-                work,
-                df,
-                [
-                    "input[name*='from']",
-                    "#dateFrom",
-                    "input[placeholder*='Inizio']",
-                    "input[aria-label*='Inizio']",
-                    "input:below(:text('Inizio'))",
-                    "input:below(:text('Dal'))",
-                ],
-            )
-            log(f"date_from filled={filled_from}")
-
-            # --- Data fine ---
-            filled_to = await _fill_first_available(
-                work,
-                dt,
-                [
-                    "input[name*='to']",
-                    "#dateTo",
-                    "input[placeholder*='Fine']",
-                    "input[aria-label*='Fine']",
-                    "input:below(:text('Fine'))",
-                    "input:below(:text('Al'))",
-                ],
-            )
-            log(f"date_to filled={filled_to}")
-
-            # Possibile bottone “Cerca/Aggiorna”
-            _ = await _click_if_any(
-                work,
-                [
-                    "button:has-text('Cerca')",
-                    "button:has-text('Ricerca')",
-                    "button:has-text('Aggiorna')",
-                    "button:has-text('Calcola')",
-                    "button:has-text('Visualizza')",
-                ],
-                timeout=PW_TIMEOUT_MS,
-            )
-            try:
-                await work.wait_for_timeout(1200)
-            except Exception:
-                pass
-
-            # Download CSV
-            # Usa get_by_role/text dove possibile
-            download_try = [
-                "button:has-text('Download CSV')",
-                "a:has-text('Download CSV')",
-                "button:has-text('Scarica CSV')",
-                "a:has-text('Scarica CSV')",
-                "[data-testid='download-csv']",
-                "#downloadCsv",
-            ]
-            # prova anche ARIA role name “CSV”
-            try:
-                if await work.get_by_role("button", name=re.compile("CSV", re.I)).count() > 0:
-                    download_try.insert(0, "role=button[name=/CSV/i]")
-            except Exception:
-                pass
-
-            # log quante corrispondenze vediamo per debug
-            counts = []
-            for sel in download_try:
+            # Cerca il bottone download
+            dl_btn = None
+            for sel in DL_SELECTORS:
+                loc = target.locator(sel)
                 try:
-                    counts.append((sel, await work.locator(sel).count()))
+                    count = loc.count()
                 except Exception:
-                    counts.append((sel, 0))
-            log("download selectors counts: " + ", ".join([f"{s}:{c}" for s, c in counts]))
+                    count = 0
+                log.write(f"Provo selettore '{sel}' -> count={count}")
+                if count > 0:
+                    dl_btn = loc.first
+                    break
 
-            download = None
-            for sel in download_try:
-                if await work.locator(sel).count() > 0:
-                    try:
-                        async with work.expect_download(timeout=PW_TIMEOUT_MS) as dl_info:
-                            await work.locator(sel).first().click()
-                        download = await dl_info.value
-                        break
-                    except PWTimeoutError:
-                        log(f"Timeout download con {sel}, riprovo…")
-                    except Exception as e:
-                        log(f"Errore download {sel}: {e}")
+            if dl_btn is None:
+                # last resort: cerca per nome ARIA che contenga “scarica”
+                dl_btn = target.get_by_role("button", name=re.compile(r"scarica", re.I))
+                try:
+                    if dl_btn.count() == 0:
+                        dl_btn = None
+                except Exception:
+                    dl_btn = None
 
-            if not download:
-                raise RuntimeError("Pulsante download CSV non trovato (verifica selettori)")
+            if dl_btn is None:
+                return {
+                    "ok": False,
+                    "detail": "Pulsante download CSV non trovato (verifica selettori)",
+                    "log": log,
+                }
 
-            suggested = download.suggested_filename or "curva_carico.csv"
-            out_path = DOWNLOAD_DIR / suggested
-            i = 1
-            while out_path.exists():
-                stem, suf = Path(suggested).stem, Path(suggested).suffix
-                out_path = DOWNLOAD_DIR / f"{stem}_{i}{suf}"
-                i += 1
+            log.write("Trovato bottone, clic e attendo il download…")
 
-            await download.save_as(out_path)
-            log(f"CSV salvato in: {out_path}")
-            return str(out_path)
+            with page.expect_event("download", timeout=timeout_ms) as dl_wait:
+                dl_btn.click()
+            download = dl_wait.value
 
+            # salva su file
+            file_name = download.suggested_filename or "curva.csv"
+            # se manca l’estensione, aggiungi csv
+            if not re.search(r"\.csv$", file_name, re.I):
+                file_name += ".csv"
+            csv_path = os.path.join(out_dir, file_name)
+            download.save_as(csv_path)
+            log.write(f"CSV salvato in: {csv_path}")
+
+            # carica in memoria e parse (facoltativo)
+            rows: List[Dict[str, Any]] = []
+            try:
+                content = download.content()
+                text = content.decode("utf-8", errors="replace")
+                reader = csv.reader(io.StringIO(text), delimiter=";")
+                header = None
+                for i, r in enumerate(reader):
+                    if i == 0:
+                        header = r
+                        continue
+                    rows.append({"raw": r})
+                log.write(f"Righe CSV (esclusa intestazione): {len(rows)}")
+            except Exception as e:
+                log.write(f"Parsing CSV fallito (non blocca): {e}")
+
+            return {"ok": True, "csv_path": csv_path, "rows": rows, "log": log}
+
+        except PWTimeout:
+            return {"ok": False, "detail": "Timeout durante il caricamento/click", "log": log}
+        except Exception as e:
+            return {"ok": False, "detail": str(e), "log": log}
         finally:
             try:
-                await context.close()
+                ctx.close()
+                browser.close()
             except Exception:
                 pass
-            try:
-                await browser.close()
-            except Exception:
-                pass
-            log("=== refresh_and_download_csv: end ===")
