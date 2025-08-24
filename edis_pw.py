@@ -1,161 +1,126 @@
-# edis_pw.py
-from __future__ import annotations
-import os, io, csv, re, json, time
-from typing import List, Dict, Any, Optional
-from playwright.sync_api import Playwright, sync_playwright, TimeoutError as PWTimeout
+import os
+import json
+from pathlib import Path
+from typing import Optional, List
 
-E_URL = "https://private.e-distribuzione.it/PortaleClienti/s/curvedicarico"
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# collezionatore log semplice
-class Logger(list):
-    def write(self, msg: str) -> None:
-        msg = str(msg).rstrip()
-        if msg:
-            self.append(msg)
+from edis_pw import refresh_and_download_csv_async, SessionMissingError
 
-def _human_selector_list(locs: List[str]) -> str:
-    return " | ".join(locs)
+APP_NAME = "e-Distribuzione CSV Middleware"
+API_KEY = os.getenv("API_KEY", "CE-eds-2025")
 
-def refresh_and_download_csv(
-    storage_state_path: str,
-    out_dir: str = "/app/tmp",
-    headless: bool = True,
-    timeout_ms: int = 45000,
-) -> Dict[str, Any]:
-    """
-    Apre la pagina Curve di carico con la sessione salvata e clicca sul bottone
-    “Scarica il dettaglio del quarto d’ora”, intercettando il download CSV.
-    Ritorna: { ok, csv_path, rows, log }
-    """
-    os.makedirs(out_dir, exist_ok=True)
+# CORS
+allow_origins_env = os.getenv("ALLOW_ORIGINS", "*")
+ALLOW_ORIGINS: List[str] = [o.strip() for o in allow_origins_env.split(",") if o.strip()]
 
-    log = Logger()
-    log.write("=== refresh_and_download_csv: start ===")
+app = FastAPI(title=APP_NAME, version="1.0")
 
-    # Se non esiste lo storage -> errore esplicativo
-    if not os.path.exists(storage_state_path):
-        return {"ok": False, "detail": f"storage_state non trovato: {storage_state_path}", "log": log}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOW_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
+)
 
-    # Selettori robusti per il bottone di download
-    DL_SELECTORS = [
-        # testuale più probabile sulla tua pagina
-        "button:has-text('Scarica il dettaglio del quarto d\\'ora')",
-        "button:has-text('Scarica il dettaglio del quarto d’ora')",  # apostrofo tipografico
-        # fallback generici
-        "button:has-text('Scarica')",
-        "button.slds-button_brand.slds-float_right",
-        "button.slds-button_brand",
-        "button:has-text('CSV')",
-    ]
-    log.write(f"Selettori download (ordine): {_human_selector_list(DL_SELECTORS)}")
+# ---- Modelli I/O -------------------------------------------------------------
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
-        ctx = browser.new_context(storage_state=storage_state_path, accept_downloads=True)
-        page = ctx.new_page()
+class RefreshIn(BaseModel):
+    pod: str = Field(..., description="POD IT00…")
+    date_from: str = Field(..., description="YYYY-MM-DD")
+    date_to: str = Field(..., description="YYYY-MM-DD")
+    use_storage: bool = Field(False, description="Usa sessione salvata")
+    username: Optional[str] = None
+    password: Optional[str] = None
 
+
+class RefreshOut(BaseModel):
+    ok: bool = True
+    detail: Optional[str] = None
+    log: List[str] = []
+    csv_text: Optional[str] = None
+    rows: Optional[list] = None
+
+
+# ---- Helpers ----------------------------------------------------------------
+
+def check_api_key(x_api_key: str | None):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+# ---- Routes -----------------------------------------------------------------
+
+@app.get("/healthz")
+async def healthz(x_api_key: Optional[str] = Header(None)):
+    # opzionale: proteggi anche /healthz
+    return {"status": "ok"}
+
+@app.get("/diag")
+async def diag(x_api_key: Optional[str] = Header(None)):
+    check_api_key(x_api_key)
+    storage_path = os.getenv("STORAGE_STATE", "/app/storage_state.json")
+    p = Path(storage_path)
+    head = {}
+    if p.exists():
         try:
-            log.write(f"Apro URL: {E_URL}")
-            page.goto(E_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_load_state("networkidle", timeout=timeout_ms)
-            time.sleep(1.0)
+            with p.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            head = {
+                "cookies_count": len(data.get("cookies", [])),
+                "origins_count": len(data.get("origins", [])),
+            }
+        except Exception:
+            head = {"cookies_count": 0, "origins_count": 0}
+    return {
+        "version": "diag-1",
+        "storage_state_path": storage_path,
+        "exists": p.exists(),
+        "size_bytes": p.stat().st_size if p.exists() else 0,
+        "head": head,
+        "allow_origins": ALLOW_ORIGINS,
+    }
 
-            # Trova il frame che contiene la UI (titolo ‘Curve di carico’)
-            target = None
-            frames = page.frames
-            log.write(f"Frame totali: {len(frames)}")
-            for f in frames:
-                url = f.url or ""
-                title = (f.title() or "")
-                score = 0
-                if "curvedicarico" in url:
-                    score += 2
-                if "Curve di carico" in title or "Curva di carico" in title:
-                    score += 1
-                log.write(f"- Frame url='{url}' title='{title}' -> score={score}")
-                if score >= 2 and target is None:
-                    target = f
-            if target is None:
-                target = page.main_frame
-                log.write("ATTENZIONE: frame ‘curvedicarico’ non trovato, uso main_frame")
 
-            # Debug: stampa tutti i bottoni visibili per aiutare il tuning
-            try:
-                btn_texts = target.locator("button").all_inner_texts()
-                sample = btn_texts[:10]
-                log.write(f"Bottoni visibili: {len(btn_texts)}  (prime 10) -> {sample}")
-            except Exception as e:
-                log.write(f"[debug] errore lettura bottoni: {e}")
+@app.post("/refresh", response_model=RefreshOut)
+async def refresh(payload: RefreshIn, x_api_key: Optional[str] = Header(None)):
+    check_api_key(x_api_key)
 
-            # Cerca il bottone download
-            dl_btn = None
-            for sel in DL_SELECTORS:
-                loc = target.locator(sel)
-                try:
-                    count = loc.count()
-                except Exception:
-                    count = 0
-                log.write(f"Provo selettore '{sel}' -> count={count}")
-                if count > 0:
-                    dl_btn = loc.first
-                    break
+    log: list[str] = []
 
-            if dl_btn is None:
-                # last resort: cerca per nome ARIA che contenga “scarica”
-                dl_btn = target.get_by_role("button", name=re.compile(r"scarica", re.I))
-                try:
-                    if dl_btn.count() == 0:
-                        dl_btn = None
-                except Exception:
-                    dl_btn = None
+    # Validazioni base
+    if payload.use_storage is False:
+        if not payload.username or not payload.password:
+            raise HTTPException(status_code=400, detail="Missing username/password")
 
-            if dl_btn is None:
-                return {
-                    "ok": False,
-                    "detail": "Pulsante download CSV non trovato (verifica selettori)",
-                    "log": log,
-                }
+    try:
+        csv_text, rows, more_log = await refresh_and_download_csv_async(
+            pod=payload.pod.strip(),
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+            use_storage=payload.use_storage,
+            username=payload.username,
+            password=payload.password,
+        )
+        log.extend(more_log or [])
 
-            log.write("Trovato bottone, clic e attendo il download…")
+        return RefreshOut(
+            ok=True,
+            log=log,
+            csv_text=csv_text,
+            rows=rows,
+        )
 
-            with page.expect_event("download", timeout=timeout_ms) as dl_wait:
-                dl_btn.click()
-            download = dl_wait.value
-
-            # salva su file
-            file_name = download.suggested_filename or "curva.csv"
-            # se manca l’estensione, aggiungi csv
-            if not re.search(r"\.csv$", file_name, re.I):
-                file_name += ".csv"
-            csv_path = os.path.join(out_dir, file_name)
-            download.save_as(csv_path)
-            log.write(f"CSV salvato in: {csv_path}")
-
-            # carica in memoria e parse (facoltativo)
-            rows: List[Dict[str, Any]] = []
-            try:
-                content = download.content()
-                text = content.decode("utf-8", errors="replace")
-                reader = csv.reader(io.StringIO(text), delimiter=";")
-                header = None
-                for i, r in enumerate(reader):
-                    if i == 0:
-                        header = r
-                        continue
-                    rows.append({"raw": r})
-                log.write(f"Righe CSV (esclusa intestazione): {len(rows)}")
-            except Exception as e:
-                log.write(f"Parsing CSV fallito (non blocca): {e}")
-
-            return {"ok": True, "csv_path": csv_path, "rows": rows, "log": log}
-
-        except PWTimeout:
-            return {"ok": False, "detail": "Timeout durante il caricamento/click", "log": log}
-        except Exception as e:
-            return {"ok": False, "detail": str(e), "log": log}
-        finally:
-            try:
-                ctx.close()
-                browser.close()
-            except Exception:
-                pass
+    except SessionMissingError as e:
+        log.append(str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.append(f"Unexpected error: {repr(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
