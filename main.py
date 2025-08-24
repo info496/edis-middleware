@@ -13,10 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.responses import PlainTextResponse, JSONResponse, FileResponse
 
-from edis_pw import refresh_and_download_csv  # <-- il tuo modulo Playwright
+from edis_pw import refresh_and_download_csv  # <-- modulo Playwright
 
 # -----------------------------------------------------------------------------
-# Configurazione
+# Config
 # -----------------------------------------------------------------------------
 
 API_TITLE = "e-Distribuzione CSV Middleware"
@@ -54,11 +54,11 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Sicurezza semplice via Header API Key
+# Sicurezza con API Key
 # -----------------------------------------------------------------------------
 def api_key_guard(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     if not API_KEY:
-        # Nessuna chiave impostata lato server -> disattivo il controllo
+        # se non c'è API_KEY lato server, non applico il guard
         return
     if x_api_key != API_KEY:
         raise HTTPException(
@@ -92,20 +92,13 @@ def _json_path(pod: str, date_from: str, date_to: str) -> Path:
 
 def _csv_to_json(csv_file: Path) -> List[dict]:
     """
-    Converte il CSV di e-Distribuzione in un JSON semplice:
-    [
-      {"timestamp": "...", "kwh_15": <float>, "quality": "..."},
-      ...
-    ]
+    Converte il CSV di e-Distribuzione in JSON semplice:
+    [{"timestamp": "...", "kwh_15": <float>, "quality": "..."}]
     """
-    # Prova a leggere con pandas (separatore ; tipico)
     df = pd.read_csv(csv_file, sep=";", engine="python")
-    # Normalizza possibili colonne
     cols = [c.lower().strip() for c in df.columns]
     df.columns = cols
 
-    # Cerco colonne "timestamp", "energia attiva", "quality" (adatta se necessario)
-    # Alcuni export usano "data/ora" o "timestamp", altri "energia attiva (kwh)"
     ts_col = None
     for c in ("timestamp", "data/ora", "data ora", "data_ora"):
         if c in df.columns:
@@ -125,19 +118,23 @@ def _csv_to_json(csv_file: Path) -> List[dict]:
             break
 
     if ts_col is None or kwh_col is None:
-        # Se non trovo colonne, restituisco JSON grezzo dal CSV
+        # fallback: restituisco il CSV come records
         return df.to_dict(orient="records")
 
     out = []
     for _, row in df.iterrows():
+        val = row.get(kwh_col)
+        kwh = None
+        if pd.notna(val):
+            try:
+                kwh = float(str(val).replace(",", "."))
+            except Exception:
+                kwh = None
+
         out.append(
             {
                 "timestamp": str(row.get(ts_col, "")),
-                "kwh_15": (
-                    float(str(row.get(kwh_col)).replace(",", "."))
-                    if pd.notna(row.get(kwh_col))
-                    else None
-                ),
+                "kwh_15": kwh,
                 "quality": (row.get(quality_col) if quality_col else None),
             }
         )
@@ -157,7 +154,6 @@ def healthz():
 
 @app.get("/diag")
 def diag():
-    # piccola diagnostica utile
     info = {
         "version": "diag-1",
         "storage_state_path": STORAGE_STATE,
@@ -183,11 +179,19 @@ def diag():
 async def refresh(payload: RefreshPayload):
     """
     Avvia Playwright:
-    - se use_storage=True usa la sessione salvata (storage_state) e NON richiede credenziali;
-    - altrimenti richiede username e password.
-    Alla fine crea/aggiorna i file cache CSV + JSON.
+      - se use_storage=True usa la sessione salvata (storage_state) e NON richiede credenziali
+      - altrimenti richiede username/password
+    Salva il CSV in cache + genera JSON.
     """
-    log: List[str] = []
+    # Logger: funzione (callable) + lista per restituire i log al client
+    log_messages: List[str] = []
+
+    def log(msg: str):
+        try:
+            log_messages.append(str(msg))
+        except Exception:
+            # best-effort
+            pass
 
     if not payload.use_storage:
         if not payload.username or not payload.password:
@@ -198,44 +202,43 @@ async def refresh(payload: RefreshPayload):
 
     csv_file = _csv_path(payload.pod, payload.date_from, payload.date_to)
     json_file = _json_path(payload.pod, payload.date_from, payload.date_to)
+
     try:
-        # ✅ CORRETTO: context manager sincrono
+        # timeout sincrono (fix __aenter__ usato prima in modo errato)
         with anyio.fail_after(PW_TIMEOUT_MS / 1000.0):
-            path = await refresh_and_download_csv(
+            downloaded_path = await refresh_and_download_csv(
                 username=payload.username,
                 password=payload.password,
                 pod=payload.pod,
                 date_from=payload.date_from,
                 date_to=payload.date_to,
                 use_storage=payload.use_storage,
-                log=log,
+                log=log,  # <--- PASSO UNA FUNZIONE, NON UNA LISTA
             )
 
-        # Sposta/normalizza il file scaricato nella cache attesa
-        downloaded = Path(path)
+        downloaded = Path(downloaded_path)
         if not downloaded.exists():
             raise RuntimeError("Download CSV non trovato")
 
+        # normalizzo posizione/nome in cache
         if downloaded.resolve() != csv_file.resolve():
             csv_file.write_bytes(downloaded.read_bytes())
 
-        # prepara JSON cache
         _ensure_json_cache(csv_file, json_file)
 
         return {
             "ok": True,
             "csv": f"/csv?pod={payload.pod}&date_from={payload.date_from}&date_to={payload.date_to}",
             "json": f"/data?pod={payload.pod}&date_from={payload.date_from}&date_to={payload.date_to}",
-            "log": log,
+            "log": log_messages,
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        # Errore lato scraping/download
         return JSONResponse(
             status_code=500,
-            content={"detail": str(e), "log": log},
+            content={"detail": str(e), "log": log_messages},
         )
 
 @app.get("/data", dependencies=[Depends(api_key_guard)])
@@ -276,7 +279,7 @@ def get_csv(
     )
 
 # -----------------------------------------------------------------------------
-# Avvio locale (non usato su Render, dove parte via start.sh / gunicorn)
+# Avvio locale (non usato su Render)
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
