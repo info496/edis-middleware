@@ -1,256 +1,176 @@
-import re
-from pathlib import Path
-from typing import Optional, Tuple, List
+# edis_pw.py
+#
+# Automazione e-Distribuzione con Playwright **async**.
+# Espone: refresh_and_download_csv_async (usato da main.py) e la
+# eccezione SessionMissingError.
 
-from playwright.async_api import Page, Frame
+from __future__ import annotations
 
-CURVE_URL = "https://private.e-distribuzione.it/PortaleClienti/s/curvedicarico"
-LOGIN_URL = "https://private.e-distribuzione.it/PortaleClienti/s/login/"
+import os
+from typing import List, Optional, Dict, Any
 
-# Riconosce sia "Scarica il dettaglio del quarto d’ora" che "Download CSV"
-_DL_REGEX = re.compile(
-    r"(scarica(?:\s+il)?\s+(?:dettaglio\s+del\s+)?quarto\s+d[’'`]ora|download\s*csv)",
-    re.IGNORECASE,
+from playwright.async_api import (
+    async_playwright,
+    TimeoutError as PWTimeout,
+    Error as PWError,
 )
 
 
-class EdisError(Exception):
-    """Eccezione con log allegato."""
-    def __init__(self, message: str, log: Optional[List[str]] = None):
-        super().__init__(message)
-        self.log = log or []
+class SessionMissingError(Exception):
+    """Sollevata se serve una sessione salvata ma non è disponibile."""
 
 
-def _to_ddmmyyyy(s: str) -> str:
-    """'2025-08-24' -> '24/08/2025'; lascia dd/mm/yyyy invariato."""
-    s = (s or "").strip()
-    if not s:
-        return s
-    if "/" in s:
-        return s
-    parts = s.split("-")
-    if len(parts) == 3 and all(parts):
-        y, m, d = parts
-        return f"{d.zfill(2)}/{m.zfill(2)}/{y}"
-    return s
+def _log(msg: str, buf: Optional[List[str]]):
+    if buf is not None:
+        buf.append(msg)
 
 
-async def _set_text(loc, value: str):
-    try:
-        await loc.scroll_into_view_if_needed()
-        await loc.wait_for(state="visible", timeout=4000)
-        await loc.click()
-        await loc.fill("")
-        await loc.type(value, delay=10)
-    except Exception:
-        pass
-
-
-async def _find_curve_frame(page: Page) -> Frame:
-    # prova ogni frame
-    for fr in page.frames:
-        url = (fr.url or "").lower()
-        try:
-            title = ((await fr.title()) or "").lower()
-        except Exception:
-            title = ""
-        if "curvedicarico" in url or "curve di carico" in title:
-            return fr
-    # fallback
-    return page.main_frame
-
-
-async def _find_download_button(frame: Frame):
-    candidates = [
-        frame.get_by_role("button", name=_DL_REGEX),
-        frame.get_by_role("link", name=_DL_REGEX),
-        frame.locator("button", has_text=_DL_REGEX),
-        frame.locator("a", has_text=_DL_REGEX),
-        frame.locator("button.slds-button_brand"),
-        frame.locator("button.slds-button.slds-button_brand.slds-float_right"),
-    ]
-    for loc in candidates:
-        try:
-            count = await loc.count()
-        except Exception:
-            continue
-        for i in range(count):
-            el = loc.nth(i)
-            try:
-                txt = (await el.inner_text()).strip().lower()
-            except Exception:
-                continue
-            if _DL_REGEX.search(txt):
-                try:
-                    await el.scroll_into_view_if_needed()
-                    await el.wait_for(state="visible", timeout=5000)
-                except Exception:
-                    pass
-                return el
-    return None
-
-
-async def _fill_filters_best_effort(frame: Frame, pod: str, date_from: str, date_to: str, log: List[str]):
-    dfrom = _to_ddmmyyyy(date_from)
-    dto = _to_ddmmyyyy(date_to)
-
-    # POD
-    try:
-        pod_loc = (
-            frame.get_by_label(re.compile("pod", re.I))
-            .or_(frame.get_by_placeholder(re.compile("pod", re.I)))
-            .or_(frame.locator("input[name*='pod' i]"))
-        )
-        if await pod_loc.count():
-            await _set_text(pod_loc.first, pod)
-        else:
-            log.append("ATTENZIONE: campo POD non trovato (best effort)")
-    except Exception:
-        log.append("ATTENZIONE: campo POD non trovato (best effort)")
-
-    # da / inizio
-    try:
-        df_loc = (
-            frame.get_by_label(re.compile("inizio|da|from", re.I))
-            .or_(frame.get_by_placeholder(re.compile(r"\d{2}/\d{2}/\d{4}")))
-        )
-        if await df_loc.count():
-            await _set_text(df_loc.first, dfrom)
-        else:
-            log.append("ATTENZIONE: campo data inizio non trovato (best effort)")
-    except Exception:
-        log.append("ATTENZIONE: campo data inizio non trovato (best effort)")
-
-    # a / fine
-    try:
-        dt_loc = (
-            frame.get_by_label(re.compile("fine|a|to", re.I))
-            .or_(frame.get_by_placeholder(re.compile(r"\d{2}/\d{2}/\d{4}")))
-        )
-        if await dt_loc.count():
-            await _set_text(dt_loc.first, dto)
-        else:
-            log.append("ATTENZIONE: campo data fine non trovato (best effort)")
-    except Exception:
-        log.append("ATTENZIONE: campo data fine non trovato (best effort)")
-
-
-async def _maybe_login(page: Page, username: str, password: str, log: List[str]) -> bool:
-    url = (page.url or "").lower()
-    if "login" not in url:
-        return True
-
-    if not username or not password:
-        log.append("Sei in login ma non hai username/password: impossibile procedere.")
-        return False
-
-    log.append("Sono in login: provo a compilare le credenziali…")
-
-    user_loc = (
-        page.get_by_label(re.compile("email|user|username", re.I))
-        .or_(page.get_by_placeholder(re.compile("email|user", re.I)))
-        .or_(page.locator("input[type='email'], input[name*='user' i]"))
-    )
-    pass_loc = (
-        page.get_by_label(re.compile("password", re.I))
-        .or_(page.get_by_placeholder(re.compile("password", re.I)))
-        .or_(page.locator("input[type='password']"))
-    )
-
-    try:
-        if await user_loc.count():
-            await _set_text(user_loc.first, username)
-        if await pass_loc.count():
-            await _set_text(pass_loc.first, password)
-        accedi = page.get_by_role("button", name=re.compile("accedi|login|entra", re.I))
-        if not await accedi.count():
-            accedi = page.locator("button.slds-button_brand")
-        if await accedi.count():
-            async with page.expect_navigation():
-                await accedi.first.click()
-        else:
-            if await pass_loc.count():
-                await pass_loc.first.press("Enter")
-                await page.wait_for_load_state("networkidle", timeout=20000)
-    except Exception:
-        pass
-
-    await page.wait_for_load_state("domcontentloaded", timeout=20000)
-    ok = "curvedicarico" in (page.url or "").lower()
-    if ok:
-        log.append("Login completato.")
-    else:
-        log.append("Login fallito o bloccato da captcha.")
-    return ok
-
-
-async def refresh_and_download_csv(
-    page: Page,
+async def refresh_and_download_csv_async(
+    *,
     pod: str,
     date_from: str,
     date_to: str,
     use_storage: bool,
-    username: str = "",
-    password: str = "",
-    download_dir: Optional[Path] = None,
-) -> Tuple[Path, List[str]]:
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    headless: bool = True,
+    log: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """
-    Raggiunge la pagina, compila i filtri (best effort), clicca il bottone download e
-    salva il CSV. Ritorna (path_file, log). Lancia EdisError in caso di problemi.
+    Raggiunge la pagina 'Curve di carico', (se necessario) effettua login,
+    imposta POD e date e scarica il CSV.
+
+    Ritorna: {"ok": True, "csv": <string csv>}
+    Lancia: RuntimeError se non trova il pulsante, SessionMissingError se
+            è richiesta la sessione ma non c’è storage_state.
     """
-    log: List[str] = []
+    _log("=== refresh_and_download_csv: start ===", log)
 
-    # 1) vai alla pagina “curve di carico”
-    await page.goto(CURVE_URL, wait_until="domcontentloaded")
-    await page.wait_for_load_state("networkidle")
+    storage_state_path = os.environ.get("STORAGE_STATE", "/app/storage_state.json")
+    if use_storage and not os.path.exists(storage_state_path):
+        raise SessionMissingError(
+            f"Storage state non trovato: {storage_state_path}. "
+            "Esegui bootstrap login e salva la sessione."
+        )
 
-    # 2) se serve login (senza storage)
-    if not use_storage and "login" in (page.url or "").lower():
-        ok = await _maybe_login(page, username, password, log)
-        if not ok:
-            raise EdisError("Login non riuscito (probabile reCAPTCHA).", log)
-        await page.goto(CURVE_URL, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle")
+    start_url = "https://private.e-distribuzione.it/PortaleClienti/s/curvedicarico"
 
-    # 3) frame
-    frame = await _find_curve_frame(page)
+    # Argomenti consigliati in container
+    launch_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-setuid-sandbox",
+    ]
 
-    # 4) scorri in basso (bottone spesso in basso a dx)
-    try:
-        await frame.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await frame.wait_for_timeout(400)
-    except Exception:
-        pass
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless, args=launch_args)
+        context = await browser.new_context(
+            storage_state=storage_state_path if use_storage else None,
+            accept_downloads=True,
+        )
+        page = await context.new_page()
 
-    # 5) filtri
-    await _fill_filters_best_effort(frame, pod=pod, date_from=date_from, date_to=date_to, log=log)
-
-    # 6) bottone download
-    btn = await _find_download_button(frame)
-    if not btn:
         try:
-            await frame.evaluate("window.scrollTo(0, 0)")
-            await frame.wait_for_timeout(300)
-        except Exception:
-            pass
-        btn = await _find_download_button(frame)
+            _log("Apro la pagina Curve di Carico…", log)
+            await page.goto(start_url, wait_until="networkidle", timeout=60_000)
 
-    if not btn:
-        raise EdisError("Pulsante download CSV non trovato (verifica selettori)", log)
+            # Se non usiamo storage, prova login (solo se form presente)
+            if not use_storage and username and password:
+                # varianti classiche su Salesforce
+                user_sel = "input[name='username'], input#username"
+                pass_sel = "input[name='password'], input#password"
+                login_btn = "button:has-text('Accedi'), button:has-text('Login')"
 
-    # 7) cartella
-    if download_dir is None:
-        download_dir = Path("/tmp")
-    download_dir.mkdir(parents=True, exist_ok=True)
+                if await page.locator(user_sel).count() > 0:
+                    _log("Login form rilevato, effettuo login…", log)
+                    await page.fill(user_sel, username)
+                    await page.fill(pass_sel, password)
+                    await page.click(login_btn)
+                    await page.wait_for_load_state("networkidle")
 
-    safe_from = _to_ddmmyyyy(date_from).replace("/", "-")
-    safe_to = _to_ddmmyyyy(date_to).replace("/", "-")
-    out_path = download_dir / f"curve_{pod}_{safe_from}_{safe_to}.csv"
+            # Se la pagina è incorniciata, scegli il frame giusto
+            target = page
+            best_score = -1
+            for f in page.frames:
+                url = f.url or ""
+                score = 0
+                if "curvedicarico" in url:
+                    score += 2
+                if await f.locator("text=Curva di carico").count():
+                    score += 1
+                if score > best_score:
+                    best_score = score
+                    target = f
+            if target is not page:
+                _log(f"Frame scelto url='{target.url}' score={best_score}", log)
 
-    # 8) click + attesa download
-    async with page.expect_download() as dl_info:
-        await btn.click()
-    dl = await dl_info.value
-    await dl.save_as(out_path.as_posix())
+            # Compila POD se presente
+            pod_sel = "input[name='pod'], input[placeholder*='POD']"
+            if await target.locator(pod_sel).count() > 0:
+                await target.fill(pod_sel, pod)
+            else:
+                _log("ATTENZIONE: campo POD non trovato (verifica selettori)", log)
 
-    return out_path, log
+            # Compila date (diverse varianti)
+            def _sels(label_it: str):
+                # piccola utility: generiamo alcuni selettori plausibili
+                return [
+                    f"input[placeholder*='{label_it}']",
+                    f"input[aria-label*='{label_it}']",
+                    f"input[name*='{ 'start' if label_it=='Inizio' else 'end' }']",
+                ]
+
+            for sel in _sels("Inizio"):
+                if await target.locator(sel).count() > 0:
+                    await target.fill(sel, date_from)
+                    break
+            else:
+                _log("ATTENZIONE: campo data inizio non trovato (verifica selettori)", log)
+
+            for sel in _sels("Fine"):
+                if await target.locator(sel).count() > 0:
+                    await target.fill(sel, date_to)
+                    break
+            else:
+                _log("ATTENZIONE: campo data fine non trovato (verifica selettori)", log)
+
+            # Click sul pulsante di download (proviamo più varianti)
+            _log("Provo click 'Download CSV' e aspetto il download…", log)
+            candidates = [
+                # CTA più evidente osservata sul portale
+                "button:has-text(\"Scarica il dettaglio del quarto d'ora\")",
+                "button:has-text(\"Scarica il dettaglio del quarto d’ora\")",
+                # fallback generici
+                "button:has-text('Download CSV')",
+                "a:has-text('Download CSV')",
+                "button:has-text('Scarica CSV')",
+                "a:has-text('Scarica CSV')",
+                "a[download*='csv']",
+            ]
+
+            for sel in candidates:
+                if await target.locator(sel).count() > 0:
+                    try:
+                        async with context.expect_download(timeout=30_000) as dl_info:
+                            await target.click(sel)
+                        download = await dl_info.value
+                        content = await download.content()
+                        csv_text = content.decode("utf-8", errors="ignore")
+                        _log("Download completato.", log)
+                        return {"ok": True, "csv": csv_text}
+                    except PWTimeout:
+                        # riprova con il prossimo selettore
+                        pass
+                    except PWError as e:
+                        _log(f"Playwright error: {e}", log)
+                        pass
+
+            raise RuntimeError("Pulsante download CSV non trovato (verifica selettori)")
+
+        finally:
+            await context.close()
+            await browser.close()
+
+
+__all__ = ["refresh_and_download_csv_async", "SessionMissingError"]
